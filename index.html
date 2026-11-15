@@ -207,6 +207,17 @@ dialog::backdrop { background:rgba(0,0,0,.2); }
 #err { position:fixed; left:50%; bottom:44px; transform:translateX(-50%); max-width:min(560px, calc(100vw - 32px)); padding:10px 14px 10px 32px; border-radius:10px;
   background:var(--menu); -webkit-backdrop-filter:blur(24px); backdrop-filter:blur(24px); box-shadow:var(--shadow); z-index:50; }
 #err::before { content:"!"; position:absolute; left:10px; top:10px; width:16px; height:16px; border-radius:50%; background:var(--red); color:#fff; font-weight:700; font-size:11px; text-align:center; line-height:16px; }
+#xfer { position:fixed; right:12px; bottom:40px; width:min(360px, calc(100vw - 24px)); padding:10px 12px; border-radius:10px; z-index:40;
+  background:var(--menu); -webkit-backdrop-filter:blur(24px); backdrop-filter:blur(24px); box-shadow:var(--shadow); }
+#xfer[hidden] { display:none; }
+.xh { display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:6px; }
+.xh .btn { height:22px; padding:0 8px; font-size:11px; }
+.xfile { display:flex; justify-content:space-between; gap:8px; font-size:11px; }
+.xfile span:first-child { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.xfile span:last-child { color:var(--label2); white-space:nowrap; }
+#xfer progress, .job .xp progress { display:block; width:100%; height:5px; margin:4px 0; accent-color:var(--accent); }
+.xs { font-size:11px; color:var(--label2); font-variant-numeric:tabular-nums; }
+.job summary { flex-wrap:wrap; } .job .xp { flex-basis:100%; min-width:0; }
 .ghost { position:fixed; top:-100px; left:0; padding:4px 10px; border-radius:12px; background:var(--accent); color:#fff; font-weight:600; }
 
 @media (max-width:760px) {
@@ -279,6 +290,7 @@ dialog::backdrop { background:rgba(0,0,0,.2); }
 <div id="menu" popover role="menu"></div>
 <div id="activity" popover><h2>Activity</h2><div id="jobs"></div></div>
 <div id="err" role="alert" hidden></div>
+<div id="xfer" hidden><div class="xh"><b id="xTitle"></b><button class="btn" id="xCancel">Cancel</button></div><div id="xBody"></div></div>
 
 <dialog id="ql" aria-labelledby="qlTitle">
   <header>
@@ -711,26 +723,78 @@ function download(list) {
   list.filter(i => !i.folder).forEach((it, i) => setTimeout(() => { const a = document.createElement('a'); a.href = downloadURL(it); a.download = ''; a.click(); }, i * 500));
 }
 
-function xhrUpload(url, f, onp) {
+// ---------- transfer progress ----------
+const dur = s => { s = Math.max(0, Math.round(s)); const h = s / 3600 | 0, m = (s / 60 | 0) % 60, ss = String(s % 60).padStart(2, '0');
+  return h ? `${h}:${String(m).padStart(2, '0')}:${ss}` : `${m}:${ss}`; };
+function meter() {  // smoothed bytes/second from (bytes, seconds) samples
+  let last = null, rate = 0;
+  return (b, t = performance.now() / 1000) => {
+    if (!last || b < last.b) last = { b, t };
+    else if (t - last.t >= 1) { const r = (b - last.b) / (t - last.t); rate = rate ? rate * .7 + r * .3 : r; last = { b, t }; }
+    return rate;
+  };
+}
+// s: { file, phase, fileFrac, done, total, filesDone, filesTotal, speed, elapsed }; missing/null = not known (yet)
+function xferHTML(s) {
+  const left = s.filesTotal != null ? s.filesTotal - s.filesDone : null, eta = s.speed && s.total ? (s.total - s.done) / s.speed : null;
+  const stats = [s.total ? `${size(s.done)} of ${size(s.total)}` : s.done ? size(s.done) : null, s.speed ? `${size(s.speed)}/s` : null,
+    left != null ? `${left} file${left === 1 ? '' : 's'} left` : null, `${dur(s.elapsed)} elapsed`, eta != null ? `about ${dur(eta)} left` : null];
+  const bar = v => `<progress max="1" ${v != null ? `value="${v}"` : ''}></progress>`;
+  return (s.file ? `<div class="xfile"><span title="${esc(s.file)}">${esc(s.file)}</span><span>${esc(s.phase || '')}</span></div>` : '') +
+    ('fileFrac' in s ? bar(s.fileFrac) : '') + bar(s.total ? s.done / s.total : null) + `<div class="xs">${stats.filter(Boolean).map(esc).join(' · ')}</div>`;
+}
+
+let upXhr = null, upCancelled = false;
+$('#xCancel').onclick = () => { upCancelled = true; upXhr?.abort(); };
+// onSend(bytes): browser -> app; onPush(bytes, total): app -> B2, streamed back by the server as JSON lines
+function xhrUpload(url, f, onSend, onPush) {
   return new Promise((res, rej) => {
-    const x = new XMLHttpRequest();
+    const x = upXhr = new XMLHttpRequest();
+    let seen = 0, last = null;
+    const read = () => {
+      const t = x.responseText, end = t.lastIndexOf('\n') + 1;
+      for (const l of t.slice(seen, end).split('\n').filter(Boolean)) {
+        try { last = JSON.parse(l); } catch { continue; }
+        if (last.bytesTotal) onPush(last.bytes, last.bytesTotal);
+      }
+      seen = end;
+    };
+    const fail = m => { if (!upCancelled) showErr(`Couldn’t upload ${f.name}: ${m}`); rej(); };
     x.open('POST', url);
-    x.upload.onprogress = e => onp(e.loaded);
-    x.onload = () => { if (x.status < 300) return res(); let m; try { m = JSON.parse(x.responseText).error; } catch {} showErr(`Couldn’t upload ${f.name}: ${m || x.statusText}`); rej(); };
-    x.onerror = () => { showErr(`Couldn’t upload ${f.name}: the connection was lost.`); rej(); };
+    x.upload.onprogress = e => onSend(e.loaded);
+    x.onprogress = read;
+    x.onload = () => {
+      if (x.status >= 300) { let m; try { m = JSON.parse(x.responseText).error; } catch {} return fail(m || x.statusText); }
+      read();
+      last?.ok ? res() : fail(last?.error || 'the server stopped before B2 confirmed the upload.');
+    };
+    x.onerror = () => fail('the connection was lost.');
+    x.onabort = () => rej();
     x.send(f);
   });
 }
 async function upload(pairs, dest = prefix) {  // pairs: [relativePath, File]
   if (!needBucket() || !pairs.length) return;
-  const total = pairs.reduce((s, [, f]) => s + f.size, 0) || 1;
+  if (!$('#xfer').hidden) return showErr('Wait for the current upload to finish, or cancel it.');
+  const total = pairs.reduce((s, [, f]) => s + f.size, 0) || 1, t0 = performance.now() / 1000, rate = meter();
   let done = 0;
+  upCancelled = false; $('#xfer').hidden = false;
+  // A file counts half once the app has it and half once B2 has it, so bar, speed and time left cover the whole trip
+  const show = (i, rel, f, sent, pushed) => {
+    const fileFrac = f.size ? (sent + pushed) / (2 * f.size) : 0, cur = done + fileFrac * f.size, title = `Uploading ${i + 1} of ${pairs.length}`;
+    $('#xTitle').textContent = title;
+    $('#xBody').innerHTML = xferHTML({ file: rel, phase: sent < f.size ? 'Sending to server' : 'Uploading to B2', fileFrac, done: cur, total,
+      filesDone: i, filesTotal: pairs.length, speed: rate(cur), elapsed: performance.now() / 1000 - t0 });
+    progress(title, cur / total);
+  };
   for (const [i, [rel, f]] of pairs.entries()) {
-    const label = `Uploading ${pairs.length > 1 ? `${i + 1} of ${pairs.length}` : base(rel)}`;
-    progress(label, done / total);
-    await xhrUpload(`/api/upload?bucket=${enc(bucket)}&path=${enc(dest + rel)}`, f, n => progress(label, (done + n) / total)).catch(() => {});
+    if (upCancelled) break;
+    show(i, rel, f, 0, 0);
+    await xhrUpload(`/api/upload?bucket=${enc(bucket)}&path=${enc(dest + rel)}`, f,
+      n => show(i, rel, f, n, 0), (n, t) => show(i, rel, f, f.size, f.size * Math.min(n / t, 1))).catch(() => {});
     done += f.size;
   }
+  $('#xfer').hidden = true; upXhr = null;
   progress(null);
   refresh(dest === prefix ? [...new Set(pairs.map(([r]) => prefix + (r.includes('/') ? r.split('/')[0] + '/' : r)))] : []);
 }
@@ -815,7 +879,7 @@ $('#dlg').onclose = async () => {
 };
 
 // ---------- jobs ----------
-const openJobs = new Set(); let running = new Set(), pollT;
+const openJobs = new Set(), jobRates = new Map(); let running = new Set(), pollT;
 async function pollJobs() {
   clearTimeout(pollT);
   const jobs = await api('/api/jobs').catch(() => []);
@@ -825,8 +889,11 @@ async function pollJobs() {
   $('#badge').hidden = !now.size; $('#badge').textContent = now.size;
   $('#jobs').innerHTML = jobs.length ? jobs.map(j => {
     const st = j.status === 'running' ? 'running' : j.status.startsWith('failed') ? 'failed' : '';
-    const label = { running: 'Running', done: 'Done', cancelled: 'Cancelled' }[j.status] || 'Failed';
-    return `<details class="job" data-id="${j.id}" ${openJobs.has(j.id) ? 'open' : ''}><summary><span class="jl" title="${esc(j.label)}">${esc(j.label)}</span><span class="st ${st}">${label}</span>${st === 'running' ? `<button class="btn" data-cancel="${j.id}">Cancel</button>` : ''}</summary><pre>${esc(j.log.join('\n') || 'No output yet.')}</pre></details>`;
+    const label = { running: 'Running', done: `Done in ${dur(j.elapsed)}`, cancelled: 'Cancelled' }[j.status] || 'Failed';
+    const p = j.progress, rate = jobRates.get(j.id) || jobRates.set(j.id, meter()).get(j.id);
+    const xp = st === 'running' ? `<div class="xp">${xferHTML({ file: j.log.at(-1), done: p?.bytes || 0, total: p?.bytesTotal,
+      filesDone: p?.files, filesTotal: p?.filesTotal, speed: p ? rate(p.bytes, j.elapsed) : 0, elapsed: j.elapsed })}</div>` : '';
+    return `<details class="job" data-id="${j.id}" ${openJobs.has(j.id) ? 'open' : ''}><summary><span class="jl" title="${esc(j.label)}">${esc(j.label)}</span><span class="st ${st}">${label}</span>${st === 'running' ? `<button class="btn" data-cancel="${j.id}">Cancel</button>` : ''}${xp}</summary><pre>${esc(j.log.join('\n') || 'No output yet.')}</pre></details>`;
   }).join('') : '<p class="none">Backups, restores and moves show up here.</p>';
   document.querySelectorAll('.job').forEach(d => { if (d.open) d.lastChild.scrollTop = 1e9; d.ontoggle = () => d.open ? openJobs.add(d.dataset.id) : openJobs.delete(d.dataset.id); });
   if (now.size) pollT = setTimeout(pollJobs, 1500);

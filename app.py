@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """B2 Browser: tiny web GUI over the official `b2` CLI. Stdlib only."""
-import base64, hmac, json, mimetypes, os, subprocess, tempfile, threading, time, uuid
+import base64, hmac, json, mimetypes, os, re, subprocess, tempfile, threading, time, uuid
 from datetime import datetime
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
@@ -60,11 +60,37 @@ def direct_url(bucket, path):
     return f"{base}/file/{quote(bucket)}/{quote(path)}?Authorization={quote(tok)}"
 
 
+SCALE = {"": 1, "k": 1e3, "M": 1e6, "G": 1e9, "T": 1e12, "P": 1e15}
+SYNC_RE = re.compile(r"updated: (\d+)(?:/(\d+))? files\s+([\d.]+)(?: / ([\d.]+))? ([kMGTP]?)B\b")
+TQDM_RE = re.compile(r"\| *([\d.]+)([kMGTP]?)/([\d.]+)([kMGTP]?) \[")
+
+
+def parse_progress(line):
+    """A b2 progress line -> {files, filesTotal, bytes, bytesTotal} (None = not known yet); other lines -> None.
+    Handles `b2 sync` ("updated: 1/2 files   2.00 / 5.40 MB") and per-file tqdm bars ("| 3.0M/12.3M [")."""
+    if m := SYNC_RE.search(line):
+        f, ft, b, bt, u = m.groups()
+        return {"files": int(f), "filesTotal": ft and int(ft), "bytes": float(b) * SCALE[u],
+                "bytesTotal": bt and float(bt) * SCALE[u]}
+    if m := TQDM_RE.search(line):
+        b, bu, t, tu = m.groups()
+        return {"files": None, "filesTotal": None, "bytes": float(b) * SCALE[bu], "bytesTotal": float(t) * SCALE[tu]}
+
+
+def out_lines(proc):
+    """Yield a process's output line by line; progress bars redraw with \r, so that splits too."""
+    buf = b""
+    while chunk := proc.stdout.read1(4096):  # read1: whatever is ready, not a full block
+        *lines, buf = (buf + chunk.replace(b"\r", b"\n")).split(b"\n")
+        yield from (l.decode(errors="replace").strip() for l in lines if l.strip())
+
+
 def start_job(label, *cmds):
     """Run b2 commands one after another; stop at the first failure (so a move never deletes after a failed copy)."""
     jid = uuid.uuid4().hex[:8]
     env = b2_env()
-    job = JOBS[jid] = {"id": jid, "label": label, "status": "running", "log": [], "proc": None}
+    job = JOBS[jid] = {"id": jid, "label": label, "status": "running", "log": [], "proc": None,
+                       "progress": None, "started": time.time(), "ended": None}
 
     def pump():
         for args in cmds:
@@ -72,15 +98,15 @@ def start_job(label, *cmds):
                 return
             proc = job["proc"] = subprocess.Popen(["b2", *args], stdout=subprocess.PIPE,
                                                   stderr=subprocess.STDOUT, env=env)
-            buf = b""
-            while chunk := proc.stdout.read(512):
-                buf += chunk.replace(b"\r", b"\n")  # progress bars redraw with \r
-                *lines, buf = buf.split(b"\n")
-                job["log"] = (job["log"] + [l.decode(errors="replace") for l in lines if l.strip()])[-200:]
+            for line in out_lines(proc):
+                if p := parse_progress(line):
+                    job["progress"] = p  # keep the log for real output, not a redraw every 100 ms
+                else:
+                    job["log"] = (job["log"] + [line])[-200:]
             if rc := proc.wait():
-                job["status"] = "cancelled" if rc < 0 else f"failed ({rc})"
+                job["status"], job["ended"] = "cancelled" if rc < 0 else f"failed ({rc})", time.time()
                 return
-        job["status"] = "done"
+        job["status"], job["ended"] = "done", time.time()
 
     threading.Thread(target=pump, daemon=True).start()
     return jid
@@ -217,10 +243,33 @@ class H(BaseHTTPRequestHandler):
                 f.write(chunk)
                 n -= len(chunk)
         try:
-            b2("file", "upload", "--no-progress", q["bucket"], f.name, q["path"].lstrip("/"))
+            if n > 0:  # browser cancelled or the connection dropped mid-send: don't upload half a file
+                raise ValueError("upload was interrupted")
+            # Stream one JSON line per b2 progress update, then a final {"ok"} or {"error"} line.
+            # The status is already 200 by the time b2 fails, so the client reads the outcome from the last line.
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-ndjson")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            proc = subprocess.Popen(["b2", "file", "upload", q["bucket"], f.name, q["path"].lstrip("/")],
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=b2_env())
+            other = []
+            try:
+                for line in out_lines(proc):
+                    if p := parse_progress(line):
+                        self.wfile.write(json.dumps(p).encode() + b"\n")
+                        self.wfile.flush()
+                    else:
+                        other.append(line)
+            except (BrokenPipeError, ConnectionResetError):  # the user cancelled: stop pushing to B2
+                proc.terminate()
+                return
+            finally:
+                proc.wait()
+            msg = {"ok": True} if proc.returncode == 0 else {"error": "\n".join(other[-5:]) or "upload failed"}
+            self.wfile.write(json.dumps(msg).encode() + b"\n")
         finally:
             os.unlink(f.name)
-        self.send(200, {"ok": True})
 
     def post_api_rm(self, q):
         d = self.body()
@@ -294,7 +343,10 @@ class H(BaseHTTPRequestHandler):
         self.send(200, {"ok": True})
 
     def get_api_jobs(self, q):
-        self.send(200, [{k: v for k, v in j.items() if k != "proc"} for j in reversed(JOBS.values())])
+        now = time.time()
+        # elapsed is computed here, so a browser whose clock differs from the server's still shows the right time
+        self.send(200, [{**{k: v for k, v in j.items() if k not in ("proc", "started", "ended")},
+                         "elapsed": (j["ended"] or now) - j["started"]} for j in reversed(JOBS.values())])
 
     def post_api_cancel(self, q):
         j = JOBS.get(self.body().get("id"))
