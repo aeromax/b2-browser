@@ -61,18 +61,21 @@ def direct_url(bucket, path):
 
 
 SCALE = {"": 1, "k": 1e3, "M": 1e6, "G": 1e9, "T": 1e12, "P": 1e15}
-SYNC_RE = re.compile(r"updated: (\d+)(?:/(\d+))? files\s+([\d.]+)(?: / ([\d.]+))? ([kMGTP]?)B\b")
-TQDM_RE = re.compile(r"\| *([\d.]+)([kMGTP]?)/([\d.]+)([kMGTP]?) \[")
+NUM = r"(\d+(?:\.\d+)?)"
+# fullmatch against b2's whole progress line, so a file name in ordinary output can't be mistaken for one
+SYNC_RE = re.compile(rf"(?:count: \d+ files +)?compare: \d+(?:/\d+)? files +updated: (\d+)(?:/(\d+))? files +"
+                     rf"{NUM}(?: / {NUM})? ([kMGTP]?)B +\d+(?:\.\d+)? [kMGTP]?B/s")
+TQDM_RE = re.compile(rf".*: +\d+%\|[^|]*\| *{NUM}([kMGTP]?)/{NUM}([kMGTP]?) \[[^\]]*\]")
 
 
 def parse_progress(line):
     """A b2 progress line -> {files, filesTotal, bytes, bytesTotal} (None = not known yet); other lines -> None.
     Handles `b2 sync` ("updated: 1/2 files   2.00 / 5.40 MB") and per-file tqdm bars ("| 3.0M/12.3M [")."""
-    if m := SYNC_RE.search(line):
+    if m := SYNC_RE.fullmatch(line):
         f, ft, b, bt, u = m.groups()
         return {"files": int(f), "filesTotal": ft and int(ft), "bytes": float(b) * SCALE[u],
                 "bytesTotal": bt and float(bt) * SCALE[u]}
-    if m := TQDM_RE.search(line):
+    if m := TQDM_RE.fullmatch(line):
         b, bu, t, tu = m.groups()
         return {"files": None, "filesTotal": None, "bytes": float(b) * SCALE[bu], "bytesTotal": float(t) * SCALE[tu]}
 
@@ -93,6 +96,15 @@ def start_job(label, *cmds):
                        "progress": None, "started": time.time(), "ended": None}
 
     def pump():
+        try:
+            run()
+        except Exception as e:  # never leave a job stuck on "running"
+            if job["proc"] and job["proc"].poll() is None:
+                job["proc"].kill()
+            job["log"].append(f"internal error: {e}")
+            job["status"], job["ended"] = "failed (internal)", time.time()
+
+    def run():
         for args in cmds:
             if job["status"] != "running":
                 return
@@ -264,6 +276,9 @@ class H(BaseHTTPRequestHandler):
             except (BrokenPipeError, ConnectionResetError):  # the user cancelled: stop pushing to B2
                 proc.terminate()
                 return
+            except BaseException:  # stop b2 so wait() below can't block on a pipe nobody reads
+                proc.kill()
+                raise
             finally:
                 proc.wait()
             msg = {"ok": True} if proc.returncode == 0 else {"error": "\n".join(other[-5:]) or "upload failed"}
