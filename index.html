@@ -152,8 +152,8 @@ svg.ic { flex:none; }
 .btn:active { filter:brightness(.94); }
 .btn.primary { background:var(--accent); color:#fff; box-shadow:none; }
 .btn.danger { background:var(--red); color:#fff; box-shadow:none; }
-input[type=text], input[type=password] { width:100%; height:28px; padding:0 8px; border-radius:6px; border:1px solid var(--field-edge); background:var(--field); }
-input[type=text]:focus, input[type=password]:focus { outline:none; border-color:var(--accent); box-shadow:0 0 0 3px var(--ring); }
+input[type=text], input[type=password], input[type=number] { width:100%; height:28px; padding:0 8px; border-radius:6px; border:1px solid var(--field-edge); background:var(--field); }
+input[type=text]:focus, input[type=password]:focus, input[type=number]:focus { outline:none; border-color:var(--accent); box-shadow:0 0 0 3px var(--ring); }
 input[type=checkbox], input[type=radio] { accent-color:var(--accent); }
 dialog { border:0; padding:0; color:inherit; background:var(--window); box-shadow:var(--shadow); }
 dialog::backdrop { background:rgba(0,0,0,.2); }
@@ -217,6 +217,9 @@ dialog::backdrop { background:rgba(0,0,0,.2); }
 .xfile span:last-child { color:var(--label2); white-space:nowrap; }
 #xfer progress, .job .xp progress { display:block; width:100%; height:5px; margin:4px 0; accent-color:var(--accent); }
 .xs { font-size:11px; color:var(--label2); font-variant-numeric:tabular-nums; }
+#xfer .xfile + progress + .xfile { margin-top:6px; }
+#xfer .xall { margin-top:8px; padding-top:4px; border-top:1px solid var(--sep); }
+.sheet p.hint { margin:4px 0 0; font-size:11px; }
 .job summary { flex-wrap:wrap; } .job .xp { flex-basis:100%; min-width:0; }
 .ghost { position:fixed; top:-100px; left:0; padding:4px 10px; border-radius:12px; background:var(--accent); color:#fff; font-weight:600; }
 
@@ -318,6 +321,8 @@ dialog::backdrop { background:rgba(0,0,0,.2); }
   <label for="prefix">Folder in this bucket</label><input type="text" id="prefix" placeholder="Top level">
   <label class="chk"><input type="checkbox" id="del"> Delete files at the destination that aren’t in the source</label>
   <label class="chk"><input type="checkbox" id="dry"> Dry run: list what would change without copying</label>
+  <label for="threads">Parallel transfers</label><input type="number" id="threads" min="1" max="64" step="1" required style="width:90px">
+  <p class="hint">How many files b2 copies at once (default 10). Raise it for many small files on a fast connection; lower it if backups slow down the rest of your network.</p>
   <div class="acts"><button class="btn primary" value="go">Start</button><button class="btn" value="" formnovalidate>Cancel</button></div>
 </form></dialog>
 
@@ -734,22 +739,26 @@ function meter() {  // smoothed bytes/second from (bytes, seconds) samples
     return rate;
   };
 }
-// s: { file, phase, fileFrac, done, total, filesDone, filesTotal, speed, elapsed }; missing/null = not known (yet)
+// s: { files: [{ name, phase, frac }], done, total, filesDone, filesTotal, speed, elapsed }; missing/null = not known (yet).
+// A file gets its own bar only when it has a frac.
 function xferHTML(s) {
   const left = s.filesTotal != null ? s.filesTotal - s.filesDone : null, eta = s.speed && s.total ? (s.total - s.done) / s.speed : null;
   const stats = [s.total ? `${size(s.done)} of ${size(s.total)}` : s.done ? size(s.done) : null, s.speed ? `${size(s.speed)}/s` : null,
     left != null ? `${left} file${left === 1 ? '' : 's'} left` : null, `${dur(s.elapsed)} elapsed`, eta != null ? `about ${dur(eta)} left` : null];
   const bar = v => `<progress max="1" ${v != null ? `value="${v}"` : ''}></progress>`;
-  return (s.file ? `<div class="xfile"><span title="${esc(s.file)}">${esc(s.file)}</span><span>${esc(s.phase || '')}</span></div>` : '') +
-    ('fileFrac' in s ? bar(s.fileFrac) : '') + bar(s.total ? s.done / s.total : null) + `<div class="xs">${stats.filter(Boolean).map(esc).join(' · ')}</div>`;
+  return (s.files || []).map(f => `<div class="xfile"><span title="${esc(f.name)}">${esc(f.name)}</span><span>${esc(f.phase || '')}</span></div>` +
+    ('frac' in f ? bar(f.frac) : '')).join('') +
+    `<div class="xall">${bar(s.total ? s.done / s.total : null)}</div><div class="xs">${stats.filter(Boolean).map(esc).join(' · ')}</div>`;
 }
 
-let upXhr = null, upCancelled = false;
-$('#xCancel').onclick = () => { upCancelled = true; upXhr?.abort(); };
+const UPLOAD_STREAMS = 4;  // files uploaded at once; b2 also splits each big file into parallel parts
+const upXhrs = new Set(); let upCancelled = false;
+$('#xCancel').onclick = () => { upCancelled = true; upXhrs.forEach(x => x.abort()); };
 // onSend(bytes): browser -> app; onPush(bytes, total): app -> B2, streamed back by the server as JSON lines
 function xhrUpload(url, f, onSend, onPush) {
   return new Promise((res, rej) => {
-    const x = upXhr = new XMLHttpRequest();
+    const x = new XMLHttpRequest();
+    upXhrs.add(x); x.onloadend = () => upXhrs.delete(x);
     let seen = 0, last = null;
     const read = () => {
       const t = x.responseText, end = t.lastIndexOf('\n') + 1;
@@ -777,24 +786,32 @@ async function upload(pairs, dest = prefix) {  // pairs: [relativePath, File]
   if (!needBucket() || !pairs.length) return;
   if (!$('#xfer').hidden) return showErr('Wait for the current upload to finish, or cancel it.');
   const total = pairs.reduce((s, [, f]) => s + f.size, 0) || 1, t0 = performance.now() / 1000, rate = meter();
-  let done = 0;
+  const active = new Set();  // { name, size, sent, pushed } for each file in flight
+  let done = 0, finished = 0, next = 0, frame = 0;
   upCancelled = false; $('#xfer').hidden = false;
-  // A file counts half once the app has it and half once B2 has it, so bar, speed and time left cover the whole trip
-  const show = (i, rel, f, sent, pushed) => {
-    const fileFrac = f.size ? (sent + pushed) / (2 * f.size) : 0, cur = done + fileFrac * f.size, title = `Uploading ${i + 1} of ${pairs.length}`;
+  // A file counts half once the app has it and half once B2 has it, so bar, speed and time left cover the whole trip.
+  // Progress events from several uploads arrive constantly, so redraw at most once per frame.
+  const frac = a => a.size ? (a.sent + a.pushed) / (2 * a.size) : 0;
+  const draw = () => frame ||= requestAnimationFrame(() => {
+    frame = 0;
+    const cur = done + [...active].reduce((t, a) => t + frac(a) * a.size, 0), title = `Uploading ${pairs.length} file${pairs.length === 1 ? '' : 's'}`;
     $('#xTitle').textContent = title;
-    $('#xBody').innerHTML = xferHTML({ file: rel, phase: sent < f.size ? 'Sending to server' : 'Uploading to B2', fileFrac, done: cur, total,
-      filesDone: i, filesTotal: pairs.length, speed: rate(cur), elapsed: performance.now() / 1000 - t0 });
-    progress(title, cur / total);
+    $('#xBody').innerHTML = xferHTML({ files: [...active].map(a => ({ name: a.name, phase: a.sent < a.size ? 'Sending to server' : 'Uploading to B2', frac: frac(a) })),
+      done: cur, total, filesDone: finished, filesTotal: pairs.length, speed: rate(cur), elapsed: performance.now() / 1000 - t0 });
+    progress(`${title}, ${finished} done`, cur / total);
+  });
+  const worker = async () => {
+    while (!upCancelled && next < pairs.length) {
+      const [rel, f] = pairs[next++], a = { name: rel, size: f.size, sent: 0, pushed: 0 };
+      active.add(a); draw();
+      await xhrUpload(`/api/upload?bucket=${enc(bucket)}&path=${enc(dest + rel)}`, f,
+        n => { a.sent = n; draw(); }, (n, t) => { a.sent = f.size; a.pushed = f.size * Math.min(n / t, 1); draw(); }).catch(() => {});
+      active.delete(a); done += f.size; finished++; draw();
+    }
   };
-  for (const [i, [rel, f]] of pairs.entries()) {
-    if (upCancelled) break;
-    show(i, rel, f, 0, 0);
-    await xhrUpload(`/api/upload?bucket=${enc(bucket)}&path=${enc(dest + rel)}`, f,
-      n => show(i, rel, f, n, 0), (n, t) => show(i, rel, f, f.size, f.size * Math.min(n / t, 1))).catch(() => {});
-    done += f.size;
-  }
-  $('#xfer').hidden = true; upXhr = null;
+  await Promise.all(Array.from({ length: Math.min(UPLOAD_STREAMS, pairs.length) }, worker));
+  cancelAnimationFrame(frame); frame = 0;
+  $('#xfer').hidden = true;
   progress(null);
   refresh(dest === prefix ? [...new Set(pairs.map(([r]) => prefix + (r.includes('/') ? r.split('/')[0] + '/' : r)))] : []);
 }
@@ -867,13 +884,14 @@ $('#upBtn').onclick = () => needBucket() && $('#pick').click();
 $('#pathbar').onclick = e => { const b = e.target.closest('[data-p]'); if (b) go(b.dataset.p); };
 
 // ---------- sync ----------
-function openSync() { if (!needBucket()) return; $('#prefix').value = prefix; $('#dlg').showModal(); }
+function openSync() { if (!needBucket()) return; $('#prefix').value = prefix; $('#threads').value = store.get('syncThreads', 10); $('#dlg').showModal(); }
 $('#syncBtn').onclick = openSync;
 $('#dlg').onclose = async () => {
   if ($('#dlg').returnValue !== 'go') return;
   if ($('#del').checked && !$('#dry').checked && !await ask({ title: 'Delete files at the destination?', message: 'Files at the destination that aren’t in the source will be removed.', ok: 'Start sync', danger: true })) return;
   try {
-    await post('/api/sync', { bucket, prefix: $('#prefix').value, local: $('#local').value, direction: $('[name=dir]:checked').value, delete: $('#del').checked, dryRun: $('#dry').checked });
+    store.set('syncThreads', $('#threads').value);
+    await post('/api/sync', { bucket, prefix: $('#prefix').value, local: $('#local').value, direction: $('[name=dir]:checked').value, delete: $('#del').checked, dryRun: $('#dry').checked, threads: +$('#threads').value });
     await pollJobs(); $('#activity').showPopover();
   } catch {}
 };
@@ -891,7 +909,7 @@ async function pollJobs() {
     const st = j.status === 'running' ? 'running' : j.status.startsWith('failed') ? 'failed' : '';
     const label = { running: 'Running', done: `Done in ${dur(j.elapsed)}`, cancelled: 'Cancelled' }[j.status] || 'Failed';
     const p = j.progress, rate = jobRates.get(j.id) || jobRates.set(j.id, meter()).get(j.id);
-    const xp = st === 'running' ? `<div class="xp">${xferHTML({ file: j.log.at(-1), done: p?.bytes || 0, total: p?.bytesTotal,
+    const xp = st === 'running' ? `<div class="xp">${xferHTML({ files: j.log.length ? [{ name: j.log.at(-1) }] : [], done: p?.bytes || 0, total: p?.bytesTotal,
       filesDone: p?.files, filesTotal: p?.filesTotal, speed: p ? rate(p.bytes, j.elapsed) : 0, elapsed: j.elapsed })}</div>` : '';
     return `<details class="job" data-id="${j.id}" ${openJobs.has(j.id) ? 'open' : ''}><summary><span class="jl" title="${esc(j.label)}">${esc(j.label)}</span><span class="st ${st}">${label}</span>${st === 'running' ? `<button class="btn" data-cancel="${j.id}">Cancel</button>` : ''}${xp}</summary><pre>${esc(j.log.join('\n') || 'No output yet.')}</pre></details>`;
   }).join('') : '<p class="none">Backups, restores and moves show up here.</p>';

@@ -297,7 +297,10 @@ class H(BaseHTTPRequestHandler):
         d = self.body()
         remote, local = uri(d.get("bucket"), d.get("prefix", "")), local_path(d.get("local"))
         src, dst = (local, remote) if d.get("direction") == "up" else (remote, local)
-        args = ["sync"] + (["--delete"] if d.get("delete") else []) + (["--dry-run"] if d.get("dryRun") else [])
+        threads = d.get("threads", 10)
+        if type(threads) is not int or not 1 <= threads <= 64:
+            raise ValueError("parallel transfers must be a whole number from 1 to 64")
+        args = ["sync", "--threads", str(threads)] + (["--delete"] if d.get("delete") else []) + (["--dry-run"] if d.get("dryRun") else [])
         self.send(200, {"id": start_job(f"{src} → {dst}", args + [src, dst])})
 
     def post_api_mkdir(self, q):
