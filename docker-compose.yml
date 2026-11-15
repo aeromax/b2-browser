@@ -7,7 +7,7 @@ services:
       # optional: enter keys in the app's Settings instead
       B2_APPLICATION_KEY_ID: ${B2_APPLICATION_KEY_ID:-}
       B2_APPLICATION_KEY: ${B2_APPLICATION_KEY:-}
-      B2UI_PASSWORD: ${B2UI_PASSWORD:-}   # set this; the app can delete bucket contents
+      B2UI_PASSWORD: ${B2UI_PASSWORD:?set B2UI_PASSWORD}   # required; the app can delete bucket contents
     volumes:
       - /mnt/user/appdata/b2-browser:/config   # saved keys + b2 auth cache
       - /mnt/user:/data                   # Unraid shares, visible as /data/<share> in the app

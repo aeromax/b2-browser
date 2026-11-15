@@ -8,7 +8,9 @@ from urllib.parse import urlparse, parse_qs, quote
 
 PORT = int(os.environ.get("PORT", 8080))
 HOST = os.environ.get("HOST", "127.0.0.1")
-PASSWORD = os.environ.get("B2UI_PASSWORD", "")  # optional HTTP basic auth (any username)
+PASSWORD = os.environ.get("B2UI_PASSWORD", "")  # HTTP basic auth (any username); required off loopback
+DATA_ROOT = os.environ.get("DATA_ROOT", "")  # if set, backup/restore local paths must stay inside it
+LOOPBACK = {"127.0.0.1", "localhost", "::1"}
 INDEX = Path(__file__).with_name("index.html")
 CONFIG_DIR = Path(os.environ.get("CONFIG_DIR", "~/.b2-browser")).expanduser()
 CONFIG, ACCOUNT_INFO = CONFIG_DIR / "config.json", CONFIG_DIR / "account_info"
@@ -88,7 +90,10 @@ def local_path(p):
     p = (p or "").strip()
     if not p or p.startswith("-"):
         raise ValueError("bad local path")
-    return str(Path(p).expanduser())
+    path = Path(p).expanduser().resolve()
+    if DATA_ROOT and not path.is_relative_to(Path(DATA_ROOT).resolve()):
+        raise ValueError(f"local path must be inside {DATA_ROOT}")
+    return str(path)
 
 
 class H(BaseHTTPRequestHandler):
@@ -116,7 +121,18 @@ class H(BaseHTTPRequestHandler):
             self.send(401, b"auth required", "text/plain", [("WWW-Authenticate", 'Basic realm="b2"')])
         return ok
 
+    def same_origin(self):
+        host = self.headers.get("Host", "")
+        # no password = localhost only, so a rebound attacker hostname can't reach it
+        if not PASSWORD and urlparse("//" + host).hostname not in LOOPBACK:
+            return False
+        # browsers send Origin on every POST; a cross-site form or fetch gets refused
+        origin = self.headers.get("Origin")
+        return origin is None or urlparse(origin).netloc == host
+
     def handle_any(self, method):
+        if not self.same_origin():
+            return self.send(403, {"error": "cross-origin request refused"})
         if not self.authed():
             return
         u = urlparse(self.path)
@@ -290,5 +306,7 @@ class H(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    if HOST not in LOOPBACK and not PASSWORD:
+        raise SystemExit(f"Refusing to listen on {HOST} without B2UI_PASSWORD set.")
     print(f"B2 Browser on http://{HOST}:{PORT}")
     ThreadingHTTPServer((HOST, PORT), H).serve_forever()

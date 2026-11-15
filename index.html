@@ -358,7 +358,7 @@ Object.entries({ image: 'jpg jpeg png gif webp avif bmp svg ico heic', video: 'm
 const kindOf = it => it.folder ? 'folder' : KIND[ext(it.name)] || 'file';
 function kindLabel(it) {
   const k = kindOf(it), E = ext(it.name).toUpperCase();
-  return k === 'folder' ? 'Folder' : k === 'pdf' ? 'PDF document' : !E ? 'Document' : `${E} ${k === 'file' ? 'file' : k}`;
+  return k === 'folder' ? 'Folder' : k === 'pdf' ? 'PDF document' : !E ? 'Document' : `${esc(E)} ${k === 'file' ? 'file' : k}`;
 }
 function icon(it) {
   if (it.folder) return '<svg class="ic" viewBox="0 0 48 40"><use href="#i-folder"/></svg>';
