@@ -572,7 +572,7 @@ content.addEventListener('click', e => {
   const s = e.target.closest('[data-sort]');
   if (s) { sort = { k: s.dataset.sort, d: sort.k === s.dataset.sort ? -sort.d : 1 }; return render(); }
   const a = e.target.closest('[data-act]');
-  if (a) return { upload: () => $('#pick').click(), ql: quickLook, dl: () => download(selItems()) }[a.dataset.act]();
+  if (a) return { upload: () => window.native ? choose() : $('#pick').click(), ql: quickLook, dl: () => download(selItems()) }[a.dataset.act]();
   const el = e.target.closest('.item');
   if (el) clickItem(e, el);
 });
@@ -654,7 +654,7 @@ function menuEntries() {
   const list = selItems();
   if (!bucket) return [{ label: 'Settings…', run: openSettings }];
   if (!list.length) return [
-    { label: 'New folder', run: newFolder }, { label: 'Upload files…', run: () => $('#pick').click() }, { label: 'Upload a folder…', run: () => $('#pickDir').click() },
+    { label: 'New folder', run: newFolder }, { label: 'Upload files…', run: () => window.native ? choose() : $('#pick').click() }, { label: 'Upload a folder…', run: () => window.native ? choose(true) : $('#pickDir').click() },
     '-', { label: 'Select all', run: () => { sel = new Set(items.map(i => i.name)); paintSel(); } }, { label: 'Reload', run: () => refresh() },
     '-', { label: 'Back up or restore…', run: openSync }];
   const files = list.filter(i => !i.folder), one = list.length === 1 ? list[0] : null;
@@ -829,6 +829,15 @@ async function upload(pairs, dest = prefix) {  // pairs: [relativePath, File]
   progress(null);
   refresh(dest === prefix ? [...new Set(pairs.map(([r]) => prefix + (r.includes('/') ? r.split('/')[0] + '/' : r)))] : []);
 }
+// Native Mac app: the shell reports each dropped file's real path, so b2 reads files where they're stored.
+async function uploadPaths(paths, dest = prefix) {
+  if (!needBucket() || !paths.length) return;
+  try {
+    await post('/api/upload_paths', { bucket, dest, paths, threads: +store.get('syncThreads', 10) });
+    await pollJobs(); $('#activity').showPopover();
+  } catch {}
+}
+const choose = async dir => uploadPaths(await window.native.choose(dir));
 async function filesFromDrop(dt) {
   const entries = [...dt.items].map(i => i.webkitGetAsEntry?.()).filter(Boolean);  // must run before the first await
   if (!entries.length) return [...dt.files].map(f => [f.name, f]);
@@ -881,7 +890,11 @@ document.addEventListener('drop', async e => {
   if (!el) return;
   const dest = el === content ? prefix : el.dataset.drop;
   if (list && !e.dataTransfer.types.includes('Files')) moveItems(list, dest);
-  else upload(await filesFromDrop(e.dataTransfer), dest);
+  else {
+    const paths = window.native ? [...e.dataTransfer.files].map(f => window.native.pathFor(f)).filter(Boolean) : [];
+    if (paths.length) uploadPaths(paths, dest);
+    else upload(await filesFromDrop(e.dataTransfer), dest);
+  }
 });
 document.addEventListener('dragend', () => { dragItems = null; setDrop(null); });
 document.addEventListener('dragleave', e => { if (!e.relatedTarget) setDrop(null); });
@@ -894,7 +907,7 @@ $('#fwdBtn').onclick = () => history.forward();
 document.querySelectorAll('[data-view]').forEach(b => b.onclick = () => { view = b.dataset.view; store.set('view', view); paintChrome(); if (bucket) render(); });
 $('#search').oninput = e => { filter = e.target.value; if (bucket) render(); };
 $('#mkdirBtn').onclick = newFolder;
-$('#upBtn').onclick = () => needBucket() && $('#pick').click();
+$('#upBtn').onclick = () => needBucket() && (window.native ? choose() : $('#pick').click());
 $('#pathbar').onclick = e => { const b = e.target.closest('[data-p]'); if (b) go(b.dataset.p); };
 
 // ---------- sync ----------

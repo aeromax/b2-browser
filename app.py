@@ -146,6 +146,85 @@ def start_job(label, *cmds, sizes=None):
     return jid
 
 
+def start_batch(label, items, workers):
+    """Run many independent b2 commands, `workers` at a time, as one job with overall progress.
+    items: [(args, name, bytes)]. One failure doesn't stop the rest; failed names are logged.
+    A huge drop (thousands of files, terabytes) stays one job, and b2 reads every file where it sits."""
+    jid = uuid.uuid4().hex[:8]
+    env = b2_env()
+    job = JOBS[jid] = {"id": jid, "label": label, "status": "running", "log": [], "proc": None, "procs": set(),
+                       "progress": None, "current": None, "started": time.time(), "ended": None}
+    total, lock = sum(n for _, _, n in items), threading.Lock()
+    st = {"next": 0, "done": 0, "bytes": 0, "failed": 0, "live": {}}  # live: index -> bytes sent so far
+
+    def publish():
+        job["progress"] = {"files": st["done"], "filesTotal": len(items), "bytesTotal": total,
+                           "bytes": st["bytes"] + sum(st["live"].values())}
+        names = [items[i][1] for i in sorted(st["live"])]
+        job["current"] = names and names[0] + (f" (+{len(names) - 1} more)" if len(names) > 1 else "")
+
+    def one(i):
+        args, name, size = items[i]
+        proc = subprocess.Popen(["b2", *args], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env)
+        with lock:
+            job["procs"].add(proc)
+            st["live"][i] = 0
+            publish()
+        tail = []
+        try:
+            for line in out_lines(proc):
+                if p := parse_progress(line):
+                    with lock:
+                        st["live"][i] = min(p["bytes"], size) if size else p["bytes"]
+                        publish()
+                else:
+                    tail = (tail + [line])[-5:]
+            rc = proc.wait()
+        finally:
+            with lock:
+                job["procs"].discard(proc)
+        with lock:
+            st["live"].pop(i, None)
+            st["done"] += 1
+            st["bytes"] += size
+            if rc and job["status"] == "running":
+                st["failed"] += 1
+                job["log"] = (job["log"] + [f"FAILED {name}: {' '.join(tail) or rc}"])[-200:]
+            publish()
+
+    def worker():
+        while True:
+            with lock:
+                if job["status"] != "running" or st["next"] >= len(items):
+                    return
+                i, st["next"] = st["next"], st["next"] + 1
+            one(i)
+
+    def pump():
+        try:
+            ts = [threading.Thread(target=worker, daemon=True) for _ in range(min(workers, len(items)))]
+            [t.start() for t in ts]
+            [t.join() for t in ts]
+            job["current"] = None
+            if job["status"] == "running":
+                job["status"] = f"failed ({st['failed']} of {len(items)} files)" if st["failed"] else "done"
+            job["ended"] = time.time()
+        except Exception as e:  # never leave a job stuck on "running"
+            for p in list(job["procs"]):
+                p.kill()
+            job["log"].append(f"internal error: {e}")
+            job["status"], job["ended"] = "failed (internal)", time.time()
+
+    publish()
+    threading.Thread(target=pump, daemon=True).start()
+    return jid
+
+
+def tree_size(root):
+    return sum(e.stat().st_size for dp, _, fs in os.walk(root) for f in fs
+               if (e := Path(dp, f)).is_file() and not e.is_symlink())
+
+
 def local_path(p):
     p = (p or "").strip()
     if not p or p.startswith("-"):
@@ -385,6 +464,31 @@ class H(BaseHTTPRequestHandler):
         label = f"{len(files)} file{'s' if len(files) > 1 else ''} → {uri(d['bucket'], d.get('dest', ''))}"
         self.send(200, {"id": start_job(label, *cmds, sizes=sizes)})
 
+    def post_api_upload_paths(self, q):
+        # native app: the shell knows each dropped file's real path, so b2 uploads straight from where it is stored
+        d = self.body()
+        paths, dest = d.get("paths"), str(d.get("dest", "")).lstrip("/")
+        threads, workers = d.get("threads", 10), d.get("workers", 4)
+        if not isinstance(paths, list) or not paths or len(paths) > 100000:
+            raise ValueError("nothing to upload")
+        if type(threads) is not int or not 1 <= threads <= 64 or type(workers) is not int or not 1 <= workers <= 16:
+            raise ValueError("bad transfer settings")
+        uri(d.get("bucket"))  # validate
+        items, nfiles, ndirs = [], 0, 0
+        for p in paths:
+            local = Path(local_path(p))
+            name = dest + local.name
+            if local.is_dir():  # a folder: b2 sync copies it in parallel, which suits tens of thousands of small files
+                items.append((["sync", "--threads", str(threads), str(local), uri(d["bucket"], name)], name + "/", tree_size(local)))
+                ndirs += 1
+            elif local.is_file():
+                items.append((["file", "upload", "--threads", str(threads), d["bucket"], str(local), name], name, local.stat().st_size))
+                nfiles += 1
+            else:
+                raise ValueError(f"not found: {local}")
+        what = ", ".join(x for x in (nfiles and f"{nfiles} file{'s' * (nfiles > 1)}", ndirs and f"{ndirs} folder{'s' * (ndirs > 1)}") if x)
+        self.send(200, {"id": start_batch(f"{what} → {uri(d['bucket'], dest)}", items, workers)})
+
     def post_api_mkdir(self, q):
         # B2 has no real folders; a zero-byte placeholder makes one appear (same as the B2 web console)
         d = self.body()
@@ -445,15 +549,16 @@ class H(BaseHTTPRequestHandler):
     def get_api_jobs(self, q):
         now = time.time()
         # elapsed is computed here, so a browser whose clock differs from the server's still shows the right time
-        self.send(200, [{**{k: v for k, v in j.items() if k not in ("proc", "started", "ended")},
+        self.send(200, [{**{k: v for k, v in j.items() if k not in ("proc", "procs", "started", "ended")},
                          "elapsed": (j["ended"] or now) - j["started"]} for j in reversed(JOBS.values())])
 
     def post_api_cancel(self, q):
         j = JOBS.get(self.body().get("id"))
         if j and j["status"] == "running":
             j["status"] = "cancelled"  # stops the job before its next command (e.g. the delete half of a move)
-            if j["proc"]:
-                j["proc"].terminate()
+            for p in [j["proc"], *j.get("procs", ())]:
+                if p:
+                    p.terminate()
         self.send(200, {"ok": True})
 
 
