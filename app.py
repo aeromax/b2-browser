@@ -1,10 +1,26 @@
 #!/usr/bin/env python3
-"""B2 Browser: tiny web GUI over the official `b2` CLI. Stdlib only."""
-import base64, hashlib, hmac, json, mimetypes, os, re, stat, subprocess, sys, tempfile, threading, time, unicodedata, uuid
+"""B2 Browser: tiny web GUI over the official `b2` CLI. File uploads run in-process on b2sdk, which ships with the CLI."""
+import base64, hmac, json, mimetypes, os, re, shutil, stat, subprocess, sys, tempfile, threading, time, unicodedata, uuid
 from datetime import datetime
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs, quote
+
+try:
+    from b2sdk.v2 import B2Api, InMemoryAccountInfo, AbstractProgressListener, UploadSourceLocalFile, SRC_LAST_MODIFIED_MILLIS
+except ImportError:  # Homebrew and pipx keep b2sdk inside the CLI's own python: run under that one instead
+    try:
+        with open(shutil.which("b2") or "", "rb") as f:
+            line = f.readline().decode()
+    except (OSError, UnicodeDecodeError):
+        line = ""
+    cmd = line[2:].split() if line.startswith("#!") else []
+    if cmd and os.path.basename(cmd[0]) == "env":
+        cmd = cmd[1:]
+    if cmd and not os.environ.get("B2UI_REEXEC"):
+        os.environ["B2UI_REEXEC"] = "1"
+        os.execvp(cmd[0], [*cmd, *sys.argv])
+    raise SystemExit("B2 Browser needs the b2 CLI and its b2sdk: pip install b2 (or brew install b2-tools)")
 
 PORT = int(os.environ.get("PORT", 8080))
 HOST = os.environ.get("HOST", "127.0.0.1")
@@ -18,10 +34,11 @@ CONFIG, ACCOUNT_INFO = CONFIG_DIR / "config.json", CONFIG_DIR / "account_info"
 TEMP_DIR = Path(os.environ.get("B2UI_TEMP_DIR") or tempfile.gettempdir())
 # Where dropped files are looked for, so they can be uploaded in place instead of being spooled.
 LOCAL_ROOTS = [r for r in os.environ.get("B2UI_LOCAL_ROOTS", DATA_ROOT or ("/Volumes" if sys.platform == "darwin" else "")).split(os.pathsep) if r]
-HASH_MIN = 100 << 20  # files at least this big are checksummed by us (with progress) before b2 sees them
+BIG = 200 << 20  # b2sdk sends files this big as parallel parts; a job runs at most two such files (or folder syncs) at once
 SPOOL_PREFIX = "b2ui-upload-"
 JOBS = {}  # ponytail: in-memory job list, lost on restart; persist if you need history
 DL_AUTH = {}  # bucket -> (download base url, token, expiry)
+SDK_AUTH, SDK_LOCK = {}, threading.Lock()  # (keyId, key) -> authorized b2sdk account info, shared by every upload
 
 
 def sweep_spool():
@@ -54,6 +71,52 @@ def b2(*args):
     if r.returncode:
         raise RuntimeError((r.stderr or r.stdout).strip())
     return r.stdout
+
+
+class Cancelled(BaseException):
+    """Raised inside b2sdk's transfer threads to stop an upload; BaseException, so its retry loops don't swallow it."""
+
+
+class Progress(AbstractProgressListener):
+    def __init__(self, on_bytes, stopped):
+        super().__init__()
+        self.on_bytes, self.stopped = on_bytes, stopped
+
+    def set_total_bytes(self, total_byte_count):
+        pass
+
+    def bytes_completed(self, byte_count):  # called as data is read for sending, from b2sdk's threads
+        if self.stopped():
+            raise Cancelled
+        self.on_bytes(byte_count)
+
+
+class LocalFile(UploadSourceLocalFile):
+    def get_content_sha1(self):
+        # b2sdk would read the whole file to SHA-1 it before sending a byte, only to label a large file with the result.
+        # Skip that: small files and every part are still hashed as they're sent, and B2 rejects any that don't match.
+        return self.content_sha1
+
+
+def sdk_bucket(bucket, threads):
+    """A b2sdk bucket whose uploads share one pool of `threads` connections. Authorizes once per key, not per file."""
+    kid, key, src = creds()
+    b2_env()  # raises the usual "not configured" error
+    try:
+        with SDK_LOCK:
+            if not (info := SDK_AUTH.get((kid, key))):
+                info = InMemoryAccountInfo()
+                B2Api(info).authorize_account("production", kid, key)
+                SDK_AUTH.clear()
+                SDK_AUTH[(kid, key)] = info
+        return B2Api(info, max_upload_workers=threads).get_bucket_by_name(bucket)
+    except Exception as e:
+        raise RuntimeError(str(e) or type(e).__name__)
+
+
+def sdk_upload(bucket, local, name, progress):
+    info = {SRC_LAST_MODIFIED_MILLIS: str(int(os.path.getmtime(local) * 1000))}  # as `b2 file upload` sets, so sync agrees
+    bucket.concatenate([LocalFile(str(local))], name, file_info=info, progress_listener=progress)
 
 
 def uri(bucket, path=""):
@@ -101,9 +164,8 @@ def out_lines(proc):
         yield from (l.decode(errors="replace").strip() for l in lines if l.strip())
 
 
-def start_job(label, *cmds, sizes=None):
-    """Run b2 commands one after another; stop at the first failure (so a move never deletes after a failed copy).
-    sizes: optional [(file name, bytes)] per command, so a batch of single-file uploads reports one overall progress."""
+def start_job(label, *cmds):
+    """Run b2 commands one after another; stop at the first failure (so a move never deletes after a failed copy)."""
     jid = uuid.uuid4().hex[:8]
     env = b2_env()
     job = JOBS[jid] = {"id": jid, "label": label, "status": "running", "log": [], "proc": None,
@@ -119,139 +181,128 @@ def start_job(label, *cmds, sizes=None):
             job["status"], job["ended"] = "failed (internal)", time.time()
 
     def run():
-        total, before = sum(n for _, n in sizes or ()), 0
-        for i, args in enumerate(cmds):
+        for args in cmds:
             if job["status"] != "running":
                 return
-            if sizes:  # show 0% right away; b2 prints nothing while it hashes a big file
-                job["current"] = sizes[i][0]
-                job["progress"] = {"files": i, "filesTotal": len(cmds), "bytes": before, "bytesTotal": total}
             proc = job["proc"] = subprocess.Popen(["b2", *args], stdout=subprocess.PIPE,
                                                   stderr=subprocess.STDOUT, env=env)
             for line in out_lines(proc):
                 if p := parse_progress(line):
-                    if sizes:
-                        p = {"files": i, "filesTotal": len(cmds), "bytes": before + min(p["bytes"], sizes[i][1]), "bytesTotal": total}
                     job["progress"] = p  # keep the log for real output, not a redraw every 100 ms
                 else:
                     job["log"] = (job["log"] + [line])[-200:]
             if rc := proc.wait():
                 job["status"], job["ended"] = "cancelled" if rc < 0 else f"failed ({rc})", time.time()
                 return
-            if sizes:
-                before += sizes[i][1]
-        job["current"] = None
         job["status"], job["ended"] = "done", time.time()
 
     threading.Thread(target=pump, daemon=True).start()
     return jid
 
 
-def start_batch(label, items, workers):
-    """Run many independent b2 commands, `workers` at a time, as one job with overall progress.
-    items: [(args, name, bytes)]. One failure doesn't stop the rest; failed names are logged.
-    A huge drop (thousands of files, terabytes) stays one job, and b2 reads every file where it sits."""
+def start_batch(label, bucket, items, threads):
+    """Run many independent transfers as one job with overall progress. items: [(what, name, bytes)], where `what` is
+    a local file Path (uploaded here with b2sdk, straight from where it sits) or b2 CLI args (a folder's `b2 sync`).
+    One failure doesn't stop the rest; failed names are logged. File uploads share one pool of `threads` connections:
+    small files go up `threads` at a time, and a big file's parts take whatever is free. At most two big files or
+    syncs run at once, so they finish one after another instead of all crawling along together."""
     jid = uuid.uuid4().hex[:8]
     env = b2_env()
+    bkt = sdk_bucket(bucket, threads) if any(isinstance(w, Path) for w, _, _ in items) else None
     job = JOBS[jid] = {"id": jid, "label": label, "status": "running", "log": [], "proc": None, "procs": set(),
                        "progress": None, "current": None, "active": [], "started": time.time(), "ended": None}
-    total, lock = sum(n for _, _, n in items), threading.Lock()
-    st = {"next": 0, "done": 0, "bytes": 0, "failed": 0, "live": {}, "hashing": {}}  # live: index -> bytes sent so far
-    # b2 reads a whole big file to checksum it before sending anything, and prints nothing meanwhile. Do that read
-    # here instead: it shows progress, and one thread hashes ahead so the next file is ready when a worker needs it.
-    big = [i for i, (a, _, n) in enumerate(items) if a[:2] == ["file", "upload"] and n >= HASH_MIN]
-    sha, ready = {}, {i: threading.Event() for i in big}
+    total, lock, heavy = sum(n for _, _, n in items), threading.Lock(), threading.Semaphore(2)
+    st = {"next": 0, "done": 0, "bytes": 0, "failed": 0, "live": {}}  # live: index -> bytes sent so far
+    running = lambda: job["status"] == "running"
 
-    def publish():
+    def publish():  # with lock held
         job["progress"] = {"files": st["done"], "filesTotal": len(items), "bytesTotal": total,
                            "bytes": st["bytes"] + sum(st["live"].values())}
-        job["active"] = ([{"name": items[i][1], "phase": "Checking file", "frac": h / (items[i][2] or 1)} for i, h in sorted(st["hashing"].items())]
-                         + [{"name": items[i][1], "phase": "Uploading", "frac": min(b / (items[i][2] or 1), 1)} for i, b in sorted(st["live"].items())])
+        job["active"] = [{"name": items[i][1], "phase": "Uploading", "frac": min(b / (items[i][2] or 1), 1)}
+                         for i, b in sorted(st["live"].items())]
         names = [a["name"] for a in job["active"]]
         job["current"] = names and names[0] + (f" (+{len(names) - 1} more)" if len(names) > 1 else "")
 
-    def hasher():
-        for i in big:
-            if job["status"] != "running":
-                break
-            h = hashlib.sha1()
-            try:
-                with open(items[i][0][-2], "rb") as f:  # args end: ..., bucket, local path, name
-                    while (chunk := f.read(8 << 20)) and job["status"] == "running":
-                        h.update(chunk)
-                        with lock:
-                            st["hashing"][i] = st["hashing"].get(i, 0) + len(chunk)
-                            publish()
-                if job["status"] == "running":
-                    sha[i] = h.hexdigest()
-            except OSError:
-                pass  # leave it unhashed: b2 will hit the same error and report it
-            with lock:
-                st["hashing"].pop(i, None)
-                publish()
-            ready[i].set()
-
-    def one(i):
-        args, name, size = items[i]
-        if i in ready:
-            while not ready[i].wait(0.5):  # being checked now, or queued behind the file before it
-                if job["status"] != "running":
-                    return
-            if i in sha:
-                args = [*args[:2], "--sha1", sha[i], *args[2:]]
+    def cli(i, args):
         proc = subprocess.Popen(["b2", *args], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env)
         with lock:
             job["procs"].add(proc)
-            st["live"][i] = 0
-            publish()
         tail = []
         try:
             for line in out_lines(proc):
                 if p := parse_progress(line):
-                    with lock:
-                        st["live"][i] = min(p["bytes"], size) if size else p["bytes"]
-                        publish()
+                    st["live"][i] = p["bytes"]
                 else:
                     tail = (tail + [line])[-5:]
             rc = proc.wait()
         finally:
             with lock:
                 job["procs"].discard(proc)
+        return rc and (" ".join(tail) or f"exit {rc}")
+
+    def sdk(i, local, name):
+        size = items[i][2]
+        try:
+            sdk_upload(bkt, local, name, Progress(lambda n: st["live"].__setitem__(i, min(n, size)), lambda: not running()))
+        except Cancelled:
+            return "cancelled"
+        except Exception as e:
+            return str(e) or type(e).__name__
+
+    def one(i):
+        what, name, size = items[i]
+        big = isinstance(what, list) or size >= BIG
+        while big and not heavy.acquire(timeout=0.5):
+            if not running():
+                return
+        try:
+            if not running():
+                return
+            with lock:
+                st["live"][i] = 0
+            err = cli(i, what) if isinstance(what, list) else sdk(i, what, name)
+        finally:
+            if big:
+                heavy.release()
         with lock:
             st["live"].pop(i, None)
             st["done"] += 1
             st["bytes"] += size
-            if rc and job["status"] == "running":
+            if err and running():
                 st["failed"] += 1
-                job["log"] = (job["log"] + [f"FAILED {name}: {' '.join(tail) or rc}"])[-200:]
-            publish()
+                job["log"] = (job["log"] + [f"FAILED {name}: {err}"])[-200:]
 
     def worker():
         while True:
             with lock:
-                if job["status"] != "running" or st["next"] >= len(items):
+                if not running() or st["next"] >= len(items):
                     return
                 i, st["next"] = st["next"], st["next"] + 1
             one(i)
 
     def pump():
         try:
-            ts = [threading.Thread(target=worker, daemon=True) for _ in range(min(workers, len(items)))]
-            if big:
-                threading.Thread(target=hasher, daemon=True).start()
+            ts = [threading.Thread(target=worker, daemon=True) for _ in range(min(threads, len(items)))]
             [t.start() for t in ts]
-            [t.join() for t in ts]
+            while any(t.is_alive() for t in ts):  # transfers only record bytes; progress is published from here
+                with lock:
+                    publish()
+                time.sleep(0.25)
+            with lock:
+                publish()
             job["current"], job["active"] = None, []
-            if job["status"] == "running":
+            if running():
                 job["status"] = f"failed ({st['failed']} of {len(items)} files)" if st["failed"] else "done"
             job["ended"] = time.time()
         except Exception as e:  # never leave a job stuck on "running"
+            job["status"] = "failed (internal)"  # also stops in-process uploads
             for p in list(job["procs"]):
                 p.kill()
             job["log"].append(f"internal error: {e}")
-            job["status"], job["ended"] = "failed (internal)", time.time()
+            job["ended"] = time.time()
 
-    publish()
+    with lock:
+        publish()
     threading.Thread(target=pump, daemon=True).start()
     return jid
 
@@ -425,32 +476,39 @@ class H(BaseHTTPRequestHandler):
         try:
             if n > 0:  # browser cancelled or the connection dropped mid-send: don't upload half a file
                 raise ValueError("upload was interrupted")
-            # Stream one JSON line per b2 progress update, then a final {"ok"} or {"error"} line.
-            # The status is already 200 by the time b2 fails, so the client reads the outcome from the last line.
+            bucket, size = sdk_bucket(q["bucket"], 10), os.path.getsize(f.name)
+            # Stream one JSON progress line every 250 ms, then a final {"ok"} or {"error"} line.
+            # The status is already 200 by the time an upload fails, so the client reads the outcome from the last line.
             self.send_response(200)
             self.send_header("Content-Type", "application/x-ndjson")
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
-            proc = subprocess.Popen(["b2", "file", "upload", q["bucket"], f.name, q["path"].lstrip("/")],
-                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=b2_env())
-            other = []
+            state = {"bytes": 0, "stop": False, "error": None}
+
+            def run():
+                try:
+                    sdk_upload(bucket, f.name, q["path"].lstrip("/"),
+                               Progress(lambda b: state.__setitem__("bytes", min(b, size)), lambda: state["stop"]))
+                except Cancelled:
+                    pass
+                except Exception as e:
+                    state["error"] = str(e) or type(e).__name__
+
+            t = threading.Thread(target=run, daemon=True)
+            t.start()
             try:
-                for line in out_lines(proc):
-                    if p := parse_progress(line):
-                        self.wfile.write(json.dumps(p).encode() + b"\n")
-                        self.wfile.flush()
-                    else:
-                        other.append(line)
-            except (BrokenPipeError, ConnectionResetError):  # the user cancelled: stop pushing to B2
-                proc.terminate()
-                return
-            except BaseException:  # stop b2 so wait() below can't block on a pipe nobody reads
-                proc.kill()
-                raise
-            finally:
-                proc.wait()
-            msg = {"ok": True} if proc.returncode == 0 else {"error": "\n".join(other[-5:]) or "upload failed"}
-            self.wfile.write(json.dumps(msg).encode() + b"\n")
+                while t.is_alive():
+                    t.join(0.25)
+                    p = {"files": None, "filesTotal": None, "bytes": state["bytes"], "bytesTotal": size}
+                    self.wfile.write(json.dumps(p).encode() + b"\n")
+                    self.wfile.flush()
+                msg = {"error": state["error"]} if state["error"] else {"ok": True}
+                self.wfile.write(json.dumps(msg).encode() + b"\n")
+            except BaseException:  # the user cancelled (connection closed) or worse: stop pushing to B2
+                state["stop"] = True
+                t.join()
+                if not isinstance(sys.exc_info()[1], (BrokenPipeError, ConnectionResetError)):
+                    raise
         finally:
             os.unlink(f.name)
 
@@ -488,27 +546,25 @@ class H(BaseHTTPRequestHandler):
         if type(threads) is not int or not 1 <= threads <= 64:
             raise ValueError("parallel transfers must be a whole number from 1 to 64")
         uri(d.get("bucket"))  # validate
-        cmds, sizes = [], []
+        items = []
         for f in files:
             local, name = Path(local_path(f.get("local"))), str(f.get("name", "")).lstrip("/")
             if not local.is_file():
                 raise ValueError(f"not a file on the server: {local}")
-            if not name or name.startswith("-"):
+            if not name:
                 raise ValueError("bad file name")
-            cmds.append(["file", "upload", "--threads", str(threads), d["bucket"], str(local), name])
-            sizes.append((name, local.stat().st_size))
+            items.append((local, name, local.stat().st_size))
         label = f"{len(files)} file{'s' if len(files) > 1 else ''} → {uri(d['bucket'], d.get('dest', ''))}"
-        self.send(200, {"id": start_job(label, *cmds, sizes=sizes)})
+        self.send(200, {"id": start_batch(label, d["bucket"], items, threads)})
 
     def post_api_upload_paths(self, q):
-        # native app: the shell knows each dropped file's real path, so b2 uploads straight from where it is stored
+        # native app: the shell knows each dropped file's real path, so files upload straight from where they are stored
         d = self.body()
-        paths, dest = d.get("paths"), str(d.get("dest", "")).lstrip("/")
-        threads, workers = d.get("threads", 10), d.get("workers", 4)
+        paths, dest, threads = d.get("paths"), str(d.get("dest", "")).lstrip("/"), d.get("threads", 10)
         if not isinstance(paths, list) or not paths or len(paths) > 100000:
             raise ValueError("nothing to upload")
-        if type(threads) is not int or not 1 <= threads <= 64 or type(workers) is not int or not 1 <= workers <= 16:
-            raise ValueError("bad transfer settings")
+        if type(threads) is not int or not 1 <= threads <= 64:
+            raise ValueError("parallel transfers must be a whole number from 1 to 64")
         uri(d.get("bucket"))  # validate
         items, nfiles, ndirs = [], 0, 0
         for p in paths:
@@ -518,12 +574,12 @@ class H(BaseHTTPRequestHandler):
                 items.append((["sync", "--threads", str(threads), str(local), uri(d["bucket"], name)], name + "/", tree_size(local)))
                 ndirs += 1
             elif local.is_file():
-                items.append((["file", "upload", "--threads", str(threads), d["bucket"], str(local), name], name, local.stat().st_size))
+                items.append((local, name, local.stat().st_size))
                 nfiles += 1
             else:
                 raise ValueError(f"not found: {local}")
         what = ", ".join(x for x in (nfiles and f"{nfiles} file{'s' * (nfiles > 1)}", ndirs and f"{ndirs} folder{'s' * (ndirs > 1)}") if x)
-        self.send(200, {"id": start_batch(f"{what} → {uri(d['bucket'], dest)}", items, workers)})
+        self.send(200, {"id": start_batch(f"{what} → {uri(d['bucket'], dest)}", d["bucket"], items, threads)})
 
     def post_api_mkdir(self, q):
         # B2 has no real folders; a zero-byte placeholder makes one appear (same as the B2 web console)
