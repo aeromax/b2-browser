@@ -29,5 +29,6 @@ Backblaze web console → Application Keys → Add a New Application Key. It nee
 | `CONFIG_DIR` | `~/.b2-browser` (`/config` in Docker) | saved key (mode 600) + b2 auth cache |
 | `B2_APPLICATION_KEY_ID`, `B2_APPLICATION_KEY` | – | optional; a key saved in Settings takes priority |
 | `B2UI_PASSWORD` | – | HTTP basic auth (any username works). Required unless `HOST` is loopback; the app won't start without it. |
+| `B2UI_TEMP_DIR` | system temp | Where uploads are spooled before going to B2 (one full copy per in-flight file, up to 4). Point it at a volume with room for your largest files. Leftovers from a crash are deleted at startup. |
 | `DATA_ROOT` | – (`/data` in Docker) | Backup/Restore local paths must be inside this folder. |
 | `HOST`, `PORT` | `127.0.0.1`, `8080` | `0.0.0.0` in Docker |

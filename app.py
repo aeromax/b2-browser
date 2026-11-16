@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """B2 Browser: tiny web GUI over the official `b2` CLI. Stdlib only."""
-import base64, hmac, json, mimetypes, os, re, subprocess, tempfile, threading, time, uuid
+import base64, hmac, json, mimetypes, os, re, stat, subprocess, sys, tempfile, threading, time, unicodedata, uuid
 from datetime import datetime
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
@@ -14,8 +14,20 @@ LOOPBACK = {"127.0.0.1", "localhost", "::1"}
 INDEX = Path(__file__).with_name("index.html")
 CONFIG_DIR = Path(os.environ.get("CONFIG_DIR", "~/.b2-browser")).expanduser()
 CONFIG, ACCOUNT_INFO = CONFIG_DIR / "config.json", CONFIG_DIR / "account_info"
+# Uploads are spooled to disk before b2 sends them; point this at a big volume for large files.
+TEMP_DIR = Path(os.environ.get("B2UI_TEMP_DIR") or tempfile.gettempdir())
+# Where dropped files are looked for, so they can be uploaded in place instead of being spooled.
+LOCAL_ROOTS = [r for r in os.environ.get("B2UI_LOCAL_ROOTS", DATA_ROOT or ("/Volumes" if sys.platform == "darwin" else "")).split(os.pathsep) if r]
+SPOOL_PREFIX = "b2ui-upload-"
 JOBS = {}  # ponytail: in-memory job list, lost on restart; persist if you need history
 DL_AUTH = {}  # bucket -> (download base url, token, expiry)
+
+
+def sweep_spool():
+    """Delete spool files orphaned by a crash or restart (nothing is mid-upload at startup)."""
+    TEMP_DIR.mkdir(parents=True, exist_ok=True)
+    for f in TEMP_DIR.glob(SPOOL_PREFIX + "*"):
+        f.unlink(missing_ok=True)
 
 
 def creds():
@@ -88,12 +100,13 @@ def out_lines(proc):
         yield from (l.decode(errors="replace").strip() for l in lines if l.strip())
 
 
-def start_job(label, *cmds):
-    """Run b2 commands one after another; stop at the first failure (so a move never deletes after a failed copy)."""
+def start_job(label, *cmds, sizes=None):
+    """Run b2 commands one after another; stop at the first failure (so a move never deletes after a failed copy).
+    sizes: optional [(file name, bytes)] per command, so a batch of single-file uploads reports one overall progress."""
     jid = uuid.uuid4().hex[:8]
     env = b2_env()
     job = JOBS[jid] = {"id": jid, "label": label, "status": "running", "log": [], "proc": None,
-                       "progress": None, "started": time.time(), "ended": None}
+                       "progress": None, "current": None, "started": time.time(), "ended": None}
 
     def pump():
         try:
@@ -105,19 +118,28 @@ def start_job(label, *cmds):
             job["status"], job["ended"] = "failed (internal)", time.time()
 
     def run():
-        for args in cmds:
+        total, before = sum(n for _, n in sizes or ()), 0
+        for i, args in enumerate(cmds):
             if job["status"] != "running":
                 return
+            if sizes:  # show 0% right away; b2 prints nothing while it hashes a big file
+                job["current"] = sizes[i][0]
+                job["progress"] = {"files": i, "filesTotal": len(cmds), "bytes": before, "bytesTotal": total}
             proc = job["proc"] = subprocess.Popen(["b2", *args], stdout=subprocess.PIPE,
                                                   stderr=subprocess.STDOUT, env=env)
             for line in out_lines(proc):
                 if p := parse_progress(line):
+                    if sizes:
+                        p = {"files": i, "filesTotal": len(cmds), "bytes": before + min(p["bytes"], sizes[i][1]), "bytesTotal": total}
                     job["progress"] = p  # keep the log for real output, not a redraw every 100 ms
                 else:
                     job["log"] = (job["log"] + [line])[-200:]
             if rc := proc.wait():
                 job["status"], job["ended"] = "cancelled" if rc < 0 else f"failed ({rc})", time.time()
                 return
+            if sizes:
+                before += sizes[i][1]
+        job["current"] = None
         job["status"], job["ended"] = "done", time.time()
 
     threading.Thread(target=pump, daemon=True).start()
@@ -132,6 +154,37 @@ def local_path(p):
     if DATA_ROOT and not path.is_relative_to(Path(DATA_ROOT).resolve()):
         raise ValueError(f"local path must be inside {DATA_ROOT}")
     return str(path)
+
+
+def locate(files):
+    """Find where dropped files already live. Browsers hide a dropped file's path, so match each file's
+    name + size + modified time against LOCAL_ROOTS. Returns one path (or None) per file."""
+    norm = lambda n: unicodedata.normalize("NFC", n)
+    want, found = {}, [None] * len(files)
+    for i, f in enumerate(files):
+        want.setdefault(norm(f["name"]), []).append(i)
+    left = len(files)
+    for root in LOCAL_ROOTS:
+        for dirpath, dirs, names in os.walk(root):  # symlinked dirs (e.g. /Volumes/Macintosh HD) aren't followed
+            dirs[:] = [d for d in dirs if not d.startswith(".")]
+            for n in names:
+                idxs = want.get(norm(n))
+                if not idxs:
+                    continue
+                p = os.path.join(dirpath, n)
+                try:
+                    st = os.lstat(p)
+                except OSError:
+                    continue
+                if not stat.S_ISREG(st.st_mode):
+                    continue
+                for i in idxs:
+                    f = files[i]
+                    if found[i] is None and st.st_size == f["size"] and abs(st.st_mtime * 1000 - f["mtime"]) <= 2000:
+                        found[i], left = p, left - 1
+            if not left:
+                return found
+    return found
 
 
 class H(BaseHTTPRequestHandler):
@@ -247,7 +300,7 @@ class H(BaseHTTPRequestHandler):
         if not q.get("path", "").strip("/"):
             raise ValueError("missing path")
         n = int(self.headers.get("Content-Length", 0))
-        with tempfile.NamedTemporaryFile(delete=False) as f:
+        with tempfile.NamedTemporaryFile(delete=False, dir=TEMP_DIR, prefix=SPOOL_PREFIX) as f:
             while n > 0:
                 chunk = self.rfile.read(min(n, 1 << 20))
                 if not chunk:
@@ -303,6 +356,35 @@ class H(BaseHTTPRequestHandler):
         args = ["sync", "--threads", str(threads)] + (["--delete"] if d.get("delete") else []) + (["--dry-run"] if d.get("dryRun") else [])
         self.send(200, {"id": start_job(f"{src} → {dst}", args + [src, dst])})
 
+    def post_api_locate(self, q):
+        files = self.body().get("files")
+        if not isinstance(files, list) or len(files) > 5000 or not all(
+                isinstance(f, dict) and isinstance(f.get("name"), str) and type(f.get("size")) is int
+                and isinstance(f.get("mtime"), (int, float)) for f in files):
+            raise ValueError("bad file list")
+        self.send(200, {"found": locate(files)})
+
+    def post_api_upload_local(self, q):
+        # upload files that already sit on the server's disk: b2 reads each in place, nothing is spooled to temp
+        d = self.body()
+        files, threads = d.get("files"), d.get("threads", 10)
+        if not isinstance(files, list) or not files or len(files) > 5000:
+            raise ValueError("no files to upload")
+        if type(threads) is not int or not 1 <= threads <= 64:
+            raise ValueError("parallel transfers must be a whole number from 1 to 64")
+        uri(d.get("bucket"))  # validate
+        cmds, sizes = [], []
+        for f in files:
+            local, name = Path(local_path(f.get("local"))), str(f.get("name", "")).lstrip("/")
+            if not local.is_file():
+                raise ValueError(f"not a file on the server: {local}")
+            if not name or name.startswith("-"):
+                raise ValueError("bad file name")
+            cmds.append(["file", "upload", "--threads", str(threads), d["bucket"], str(local), name])
+            sizes.append((name, local.stat().st_size))
+        label = f"{len(files)} file{'s' if len(files) > 1 else ''} → {uri(d['bucket'], d.get('dest', ''))}"
+        self.send(200, {"id": start_job(label, *cmds, sizes=sizes)})
+
     def post_api_mkdir(self, q):
         # B2 has no real folders; a zero-byte placeholder makes one appear (same as the B2 web console)
         d = self.body()
@@ -310,7 +392,7 @@ class H(BaseHTTPRequestHandler):
         if not path:
             raise ValueError("missing folder name")
         uri(d.get("bucket"), path)  # validate
-        with tempfile.NamedTemporaryFile() as f:
+        with tempfile.NamedTemporaryFile(dir=TEMP_DIR) as f:
             b2("file", "upload", "--no-progress", d["bucket"], f.name, f"{path}/.bzEmpty")
         self.send(200, {"ok": True})
 
@@ -378,5 +460,6 @@ class H(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     if HOST not in LOOPBACK and not PASSWORD:
         raise SystemExit(f"Refusing to listen on {HOST} without B2UI_PASSWORD set.")
+    sweep_spool()
     print(f"B2 Browser on http://{HOST}:{PORT}")
     ThreadingHTTPServer((HOST, PORT), H).serve_forever()

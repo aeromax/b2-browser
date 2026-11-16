@@ -7,6 +7,7 @@ services:
       # optional: enter keys in the app's Settings instead
       B2_APPLICATION_KEY_ID: ${B2_APPLICATION_KEY_ID:-}
       B2_APPLICATION_KEY: ${B2_APPLICATION_KEY:-}
+      B2UI_TEMP_DIR: /config/tmp   # upload spool; point at a volume with room for your largest file
       B2UI_PASSWORD: ${B2UI_PASSWORD:?set B2UI_PASSWORD}   # required; the app can delete bucket contents
     volumes:
       - /mnt/user/appdata/b2-browser:/config   # saved keys + b2 auth cache
