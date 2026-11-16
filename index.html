@@ -936,7 +936,7 @@ async function pollJobs() {
     const st = j.status === 'running' ? 'running' : j.status.startsWith('failed') ? 'failed' : '';
     const label = { running: 'Running', done: `Done in ${dur(j.elapsed)}`, cancelled: 'Cancelled' }[j.status] || 'Failed';
     const p = j.progress, rate = jobRates.get(j.id) || jobRates.set(j.id, meter()).get(j.id);
-    const xp = st === 'running' ? `<div class="xp">${xferHTML({ files: j.current ? [{ name: j.current }] : j.log.length ? [{ name: j.log.at(-1) }] : [], done: p?.bytes || 0, total: p?.bytesTotal,
+    const xp = st === 'running' ? `<div class="xp">${xferHTML({ files: j.active?.length ? j.active : j.current ? [{ name: j.current }] : j.log.length ? [{ name: j.log.at(-1) }] : [], done: p?.bytes || 0, total: p?.bytesTotal,
       filesDone: p?.files, filesTotal: p?.filesTotal, speed: p ? rate(p.bytes, j.elapsed) : 0, elapsed: j.elapsed })}</div>` : '';
     return `<details class="job" data-id="${j.id}" ${openJobs.has(j.id) ? 'open' : ''}><summary><span class="jl" title="${esc(j.label)}">${esc(j.label)}</span><span class="st ${st}">${label}</span>${st === 'running' ? `<button class="btn" data-cancel="${j.id}">Cancel</button>` : ''}${xp}</summary><pre>${esc(j.log.join('\n') || 'No output yet.')}</pre></details>`;
   }).join('') : '<p class="none">Backups, restores and moves show up here.</p>';

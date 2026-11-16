@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """B2 Browser: tiny web GUI over the official `b2` CLI. Stdlib only."""
-import base64, hmac, json, mimetypes, os, re, stat, subprocess, sys, tempfile, threading, time, unicodedata, uuid
+import base64, hashlib, hmac, json, mimetypes, os, re, stat, subprocess, sys, tempfile, threading, time, unicodedata, uuid
 from datetime import datetime
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
@@ -18,6 +18,7 @@ CONFIG, ACCOUNT_INFO = CONFIG_DIR / "config.json", CONFIG_DIR / "account_info"
 TEMP_DIR = Path(os.environ.get("B2UI_TEMP_DIR") or tempfile.gettempdir())
 # Where dropped files are looked for, so they can be uploaded in place instead of being spooled.
 LOCAL_ROOTS = [r for r in os.environ.get("B2UI_LOCAL_ROOTS", DATA_ROOT or ("/Volumes" if sys.platform == "darwin" else "")).split(os.pathsep) if r]
+HASH_MIN = 100 << 20  # files at least this big are checksummed by us (with progress) before b2 sees them
 SPOOL_PREFIX = "b2ui-upload-"
 JOBS = {}  # ponytail: in-memory job list, lost on restart; persist if you need history
 DL_AUTH = {}  # bucket -> (download base url, token, expiry)
@@ -153,18 +154,51 @@ def start_batch(label, items, workers):
     jid = uuid.uuid4().hex[:8]
     env = b2_env()
     job = JOBS[jid] = {"id": jid, "label": label, "status": "running", "log": [], "proc": None, "procs": set(),
-                       "progress": None, "current": None, "started": time.time(), "ended": None}
+                       "progress": None, "current": None, "active": [], "started": time.time(), "ended": None}
     total, lock = sum(n for _, _, n in items), threading.Lock()
-    st = {"next": 0, "done": 0, "bytes": 0, "failed": 0, "live": {}}  # live: index -> bytes sent so far
+    st = {"next": 0, "done": 0, "bytes": 0, "failed": 0, "live": {}, "hashing": {}}  # live: index -> bytes sent so far
+    # b2 reads a whole big file to checksum it before sending anything, and prints nothing meanwhile. Do that read
+    # here instead: it shows progress, and one thread hashes ahead so the next file is ready when a worker needs it.
+    big = [i for i, (a, _, n) in enumerate(items) if a[:2] == ["file", "upload"] and n >= HASH_MIN]
+    sha, ready = {}, {i: threading.Event() for i in big}
 
     def publish():
         job["progress"] = {"files": st["done"], "filesTotal": len(items), "bytesTotal": total,
                            "bytes": st["bytes"] + sum(st["live"].values())}
-        names = [items[i][1] for i in sorted(st["live"])]
+        job["active"] = ([{"name": items[i][1], "phase": "Checking file", "frac": h / (items[i][2] or 1)} for i, h in sorted(st["hashing"].items())]
+                         + [{"name": items[i][1], "phase": "Uploading", "frac": min(b / (items[i][2] or 1), 1)} for i, b in sorted(st["live"].items())])
+        names = [a["name"] for a in job["active"]]
         job["current"] = names and names[0] + (f" (+{len(names) - 1} more)" if len(names) > 1 else "")
+
+    def hasher():
+        for i in big:
+            if job["status"] != "running":
+                break
+            h = hashlib.sha1()
+            try:
+                with open(items[i][0][-2], "rb") as f:  # args end: ..., bucket, local path, name
+                    while (chunk := f.read(8 << 20)) and job["status"] == "running":
+                        h.update(chunk)
+                        with lock:
+                            st["hashing"][i] = st["hashing"].get(i, 0) + len(chunk)
+                            publish()
+                if job["status"] == "running":
+                    sha[i] = h.hexdigest()
+            except OSError:
+                pass  # leave it unhashed: b2 will hit the same error and report it
+            with lock:
+                st["hashing"].pop(i, None)
+                publish()
+            ready[i].set()
 
     def one(i):
         args, name, size = items[i]
+        if i in ready:
+            while not ready[i].wait(0.5):  # being checked now, or queued behind the file before it
+                if job["status"] != "running":
+                    return
+            if i in sha:
+                args = [*args[:2], "--sha1", sha[i], *args[2:]]
         proc = subprocess.Popen(["b2", *args], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env)
         with lock:
             job["procs"].add(proc)
@@ -203,9 +237,11 @@ def start_batch(label, items, workers):
     def pump():
         try:
             ts = [threading.Thread(target=worker, daemon=True) for _ in range(min(workers, len(items)))]
+            if big:
+                threading.Thread(target=hasher, daemon=True).start()
             [t.start() for t in ts]
             [t.join() for t in ts]
-            job["current"] = None
+            job["current"], job["active"] = None, []
             if job["status"] == "running":
                 job["status"] = f"failed ({st['failed']} of {len(items)} files)" if st["failed"] else "done"
             job["ended"] = time.time()
