@@ -69,6 +69,7 @@ class Downloads(Base):
             self.assertEqual(r.status, 200)
             self.assertIsNone(r.headers["Content-Length"])
             r.read()
+            self.assertIsNone(app.DOWNLOADS[f"x{s}"]["size"])
 
     def test_cancel_unknown_id_ok(self):
         self.assertEqual(self.post("/api/download_cancel", {"id": "nope"}), {"ok": True})
@@ -77,6 +78,70 @@ class Downloads(Base):
         for _ in range(2):
             self.get("/api/download?bucket=b&path=f.bin&id=same&size=3145728").read()
         self.assertEqual([e["id"] for e in self.list()], ["same"])
+
+
+def wait_status(t, id):
+    for _ in range(50):
+        d = {e["id"]: e for e in t.list()}
+        if d[id]["status"] != "running":
+            break
+        time.sleep(0.1)
+    return d[id]
+
+
+class Short(Base):
+    def test_short_stream_fails(self):
+        r = self.get("/api/download?bucket=b&path=f.bin&id=s1&size=4194304")
+        try:
+            r.read()
+        except Exception:
+            pass
+        self.assertEqual(wait_status(self, "s1")["status"], "failed")
+
+
+class Long(Base):
+    def test_long_stream_fails_and_is_capped(self):
+        r = self.get("/api/download?bucket=b&path=f.bin&id=l1&size=2097152")
+        self.assertEqual(len(r.read()), 2097152)
+        d = wait_status(self, "l1")
+        self.assertEqual(d["status"], "failed")
+        self.assertEqual(d["sent"], 2097152)
+
+
+class Disconnect(Base):
+    script = "head -c 20971520 /dev/zero\n"
+
+    def test_client_disconnect_ends_not_running(self):
+        r = self.get("/api/download?bucket=b&path=f.bin&id=c1&size=20971520")
+        r.read(1024)
+        r.close()
+        self.assertIn(wait_status(self, "c1")["status"], ("failed", "done"))
+        self.assertFalse([e for e in self.list() if e["status"] == "running"])
+
+
+class Concurrent(Base):
+    def test_registering_while_listing(self):
+        errs, stop = [], threading.Event()
+
+        def poll():
+            while not stop.is_set():
+                try:
+                    self.list()
+                except Exception as e:
+                    errs.append(e)
+
+        def track(i):
+            for j in range(50):
+                app.track_download(f"t{i}-{j}", "n", 1)
+
+        p = threading.Thread(target=poll)
+        p.start()
+        ts = [threading.Thread(target=track, args=(i,)) for i in range(8)]
+        [t.start() for t in ts]
+        [t.join() for t in ts]
+        stop.set()
+        p.join()
+        self.assertEqual(errs, [])
 
 
 class Cancel(Base):

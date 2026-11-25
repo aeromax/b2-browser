@@ -354,10 +354,16 @@ def locate(files):
     return found
 
 
+def prune_downloads():
+    now = time.time()
+    for k, d in list(DOWNLOADS.items()):
+        if d["ended"] and now - d["ended"] > 60:
+            DOWNLOADS.pop(k, None)
+
+
 def track_download(id, name, size):
     now = time.time()
-    for k in [k for k, d in DOWNLOADS.items() if d["ended"] and now - d["ended"] > 60]:
-        del DOWNLOADS[k]
+    prune_downloads()
     DOWNLOADS.pop(id, None)  # a reused id replaces the old entry
     d = DOWNLOADS[id] = {"id": id, "name": name, "size": size, "sent": 0, "status": "running",
                          "proc": None, "started": now, "ended": None}
@@ -447,6 +453,8 @@ class H(BaseHTTPRequestHandler):
                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=b2_env())
         if dl:
             dl["proc"] = proc
+            if dl["status"] == "cancelled":  # cancelled before the process existed
+                proc.terminate()
         self.send_response(200)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Disposition", f"{disposition}; filename*=UTF-8''{quote(path.rsplit('/', 1)[-1])}")
@@ -455,13 +463,16 @@ class H(BaseHTTPRequestHandler):
         sent = 0
         try:
             self.end_headers()
-            while (limit is None or sent < limit) and (chunk := proc.stdout.read(1 << 20)):
+            cap = limit if dl is None or dl["size"] is None else dl["size"]  # never send more than Content-Length
+            while (cap is None or sent < cap) and (chunk := proc.stdout.read(1 << 20 if cap is None else min(1 << 20, cap - sent))):
                 self.wfile.write(chunk)
                 sent += len(chunk)
                 if dl:
                     dl["sent"] = sent
             if dl and dl["status"] == "running":
-                dl["status"] = "failed" if dl["size"] is not None and sent < dl["size"] else "done"
+                short = dl["size"] is not None and sent < dl["size"]
+                long = dl["size"] is not None and sent >= dl["size"] and proc.stdout.read(1)  # b2 has more than the page thought
+                dl["status"] = "failed" if short or long else "done"
         except (BrokenPipeError, ConnectionResetError):  # browser went away: stop b2 too
             if dl and dl["status"] == "running":
                 dl["status"] = "failed"
@@ -470,6 +481,8 @@ class H(BaseHTTPRequestHandler):
             proc.stdout.close()
             proc.wait()  # reap it
             if dl:
+                if dl["status"] == "running":  # any other exception
+                    dl["status"] = "failed"
                 dl["ended"], dl["proc"] = time.time(), None
 
     def get_api_download(self, q):
@@ -688,9 +701,10 @@ class H(BaseHTTPRequestHandler):
         self.send(200, {"ok": True})
 
     def get_api_downloads(self, q):
+        prune_downloads()
         now = time.time()
         self.send(200, [{**{k: v for k, v in d.items() if k not in ("proc", "started", "ended")},
-                         "elapsed": (d["ended"] or now) - d["started"]} for d in reversed(DOWNLOADS.values())])
+                         "elapsed": (d["ended"] or now) - d["started"]} for d in reversed(list(DOWNLOADS.values()))])
 
     def post_api_download_cancel(self, q):
         d = DOWNLOADS.get(self.body().get("id"))

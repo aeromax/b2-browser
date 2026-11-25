@@ -207,10 +207,10 @@ dialog::backdrop { background:rgba(0,0,0,.2); }
 #err { position:fixed; left:50%; bottom:44px; transform:translateX(-50%); max-width:min(560px, calc(100vw - 32px)); padding:10px 14px 10px 32px; border-radius:10px;
   background:var(--menu); -webkit-backdrop-filter:blur(24px); backdrop-filter:blur(24px); box-shadow:var(--shadow); z-index:50; }
 #err::before { content:"!"; position:absolute; left:10px; top:10px; width:16px; height:16px; border-radius:50%; background:var(--red); color:#fff; font-weight:700; font-size:11px; text-align:center; line-height:16px; }
-#xfer, #dl { position:fixed; right:12px; bottom:40px; width:min(360px, calc(100vw - 24px)); padding:10px 12px; border-radius:10px; z-index:40;
+#stack { position:fixed; right:12px; bottom:40px; width:min(360px, calc(100vw - 24px)); display:flex; flex-direction:column-reverse; gap:8px; z-index:40; }
+#xfer, #dl { padding:10px 12px; border-radius:10px;
   background:var(--menu); -webkit-backdrop-filter:blur(24px); backdrop-filter:blur(24px); box-shadow:var(--shadow); }
 #xfer[hidden], #dl[hidden] { display:none; }
-#xfer:not([hidden]) ~ #dl { bottom:170px; }
 .xh { display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:6px; }
 .xh .btn { height:22px; padding:0 8px; font-size:11px; }
 .xfile { display:flex; justify-content:space-between; gap:8px; font-size:11px; }
@@ -294,8 +294,8 @@ dialog::backdrop { background:rgba(0,0,0,.2); }
 <div id="menu" popover role="menu"></div>
 <div id="activity" popover><h2>Activity</h2><div id="jobs"></div></div>
 <div id="err" role="alert" hidden></div>
-<div id="xfer" hidden><div class="xh"><b id="xTitle"></b><button class="btn" id="xCancel">Cancel</button></div><div id="xBody"></div></div>
-<div id="dl" hidden><div class="xh"><b id="dlTitle"></b><button class="btn" id="dlCancel">Cancel all</button></div><div id="dlBody"></div></div>
+<div id="stack"><div id="xfer" hidden><div class="xh"><b id="xTitle"></b><button class="btn" id="xCancel">Cancel</button></div><div id="xBody"></div></div>
+<div id="dl" hidden><div class="xh"><b id="dlTitle"></b><button class="btn" id="dlCancel">Cancel all</button></div><div id="dlBody"></div></div></div>
 
 <dialog id="ql" aria-labelledby="qlTitle">
   <header>
@@ -549,7 +549,7 @@ function quickLook() {
   $('#qlBody').innerHTML = previewHTML(it, true);
   if (!$('#ql').open) $('#ql').showModal();
 }
-$('#qlDl').onclick = () => { const it = byKey.get(qlKey); if (it) { $('#qlDl').href = trackedURL(it); setTimeout(pollDownloads, 300); } };
+$('#qlDl').onclick = () => { const it = byKey.get(qlKey); if (it) { $('#qlDl').href = trackedURL(it); kickDownloads(); } };
 $('#ql').onclose = () => { $('#qlBody').innerHTML = ''; qlKey = null; content.focus(); };
 $('#qlClose').onclick = () => $('#ql').close();
 $('#ql').onclick = e => { if (e.target === $('#ql')) $('#ql').close(); };
@@ -730,7 +730,7 @@ async function del(list) {
   progress(null); refresh([]);
 }
 function download(list) {
-  list.filter(i => !i.folder).forEach((it, i) => setTimeout(() => { const a = document.createElement('a'); a.href = trackedURL(it); a.download = ''; a.click(); setTimeout(pollDownloads, 300); }, i * 500));
+  list.filter(i => !i.folder).forEach((it, i) => setTimeout(() => { const a = document.createElement('a'); a.href = trackedURL(it); a.download = ''; a.click(); kickDownloads(); }, i * 500));
 }
 
 // ---------- transfer progress ----------
@@ -929,10 +929,14 @@ $('#dlg').onclose = async () => {
 };
 
 // ---------- downloads ----------
+const kickDownloads = () => [300, 1000, 2000].forEach(t => setTimeout(pollDownloads, t));
 const dlRates = new Map(), dlBatch = new Set(), dlNoted = new Set(); let dlT;
 async function pollDownloads() {
   clearTimeout(dlT);
-  const all = await api('/api/downloads').catch(() => []), run = all.filter(d => d.status === 'running');
+  let all;
+  try { const r = await fetch('/api/downloads'); if (!r.ok) throw 0; all = await r.json(); }  // quiet: a background poll shouldn't toast
+  catch { if (!$('#dl').hidden) dlT = setTimeout(pollDownloads, 1000); return; }
+  const run = all.filter(d => d.status === 'running');
   run.forEach(d => dlBatch.add(d.id));
   all.forEach(d => { if (d.status === 'failed' && dlBatch.has(d.id) && !dlNoted.has(d.id)) { dlNoted.add(d.id); showErr(`Couldn’t download ${base(d.name)}.`); } });
   $('#dl').hidden = !run.length;
