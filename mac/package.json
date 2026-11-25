@@ -18,7 +18,7 @@
     "mac": { "category": "public.app-category.utilities", "identity": null }
   },
   "devDependencies": {
-    "electron": "^33.2.0",
+    "electron": "^42.11.16",
     "electron-builder": "^25.1.8"
   }
 }
