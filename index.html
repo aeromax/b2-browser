@@ -218,7 +218,7 @@ dialog::backdrop { background:rgba(0,0,0,.2); }
 .xfile span:last-child { color:var(--label2); white-space:nowrap; }
 #xfer progress, #dl progress, .job .xp progress { display:block; width:100%; height:5px; margin:4px 0; accent-color:var(--accent); }
 .xs { font-size:11px; color:var(--label2); font-variant-numeric:tabular-nums; }
-#xfer .xfile + progress, #dl .xfile + progress + .xfile { margin-top:6px; }
+#xfer .xfile + progress + .xfile, #dl .xfile + progress + .xfile { margin-top:6px; }
 #xfer .xall, #dl .xall { margin-top:8px; padding-top:4px; border-top:1px solid var(--sep); }
 .sheet p.hint { margin:4px 0 0; font-size:11px; }
 .job summary { flex-wrap:wrap; } .job .xp { flex-basis:100%; min-width:0; }
@@ -503,8 +503,9 @@ function status() {
   const n = items.length, s = selItems(), bytes = s.reduce((t, i) => t + (i.folder ? 0 : i.size), 0);
   $('#stat').textContent = !bucket ? '' : s.length ? `${s.length} of ${n} selected${bytes ? ', ' + size(bytes) : ''}` : `${n} item${n === 1 ? '' : 's'}`;
 }
-function progress(label, frac) {
-  uploading = label != null;
+let statOwner = null;  // 'dl' while the download summary owns the status bar
+function progress(label, frac, owner) {
+  uploading = label != null; statOwner = uploading ? owner : null;
   if (!uploading) return status();
   $('#stat').innerHTML = `<span>${esc(label)}</span><progress max="1" value="${frac}"></progress>`;
 }
@@ -928,7 +929,7 @@ $('#dlg').onclose = async () => {
 };
 
 // ---------- downloads ----------
-const dlRates = new Map(), dlBatch = new Set(), dlNoted = new Set(); let dlT, dlOwns = false;
+const dlRates = new Map(), dlBatch = new Set(), dlNoted = new Set(); let dlT;
 async function pollDownloads() {
   clearTimeout(dlT);
   const all = await api('/api/downloads').catch(() => []), run = all.filter(d => d.status === 'running');
@@ -941,11 +942,11 @@ async function pollDownloads() {
     $('#dlTitle').textContent = title;
     $('#dlBody').innerHTML = xferHTML({ files: run.map(d => ({ name: d.name, phase: '', frac: d.size ? d.sent / d.size : null })), done, total,
       filesDone: dlBatch.size - run.length, filesTotal: dlBatch.size, speed: rate, elapsed: Math.max(...run.map(d => d.elapsed)) });
-    if (!uploading || dlOwns) { progress(title, total ? done / total : 0); dlOwns = true; }
+    if (!uploading || statOwner === 'dl') progress(title, total ? done / total : 0, 'dl');
     dlT = setTimeout(pollDownloads, 500);
   } else {
     dlBatch.clear(); dlRates.clear();
-    if (dlOwns) { dlOwns = false; progress(null); }
+    if (statOwner === 'dl') progress(null);
   }
 }
 $('#dlCancel').onclick = async () => {
