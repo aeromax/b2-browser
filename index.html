@@ -207,18 +207,19 @@ dialog::backdrop { background:rgba(0,0,0,.2); }
 #err { position:fixed; left:50%; bottom:44px; transform:translateX(-50%); max-width:min(560px, calc(100vw - 32px)); padding:10px 14px 10px 32px; border-radius:10px;
   background:var(--menu); -webkit-backdrop-filter:blur(24px); backdrop-filter:blur(24px); box-shadow:var(--shadow); z-index:50; }
 #err::before { content:"!"; position:absolute; left:10px; top:10px; width:16px; height:16px; border-radius:50%; background:var(--red); color:#fff; font-weight:700; font-size:11px; text-align:center; line-height:16px; }
-#xfer { position:fixed; right:12px; bottom:40px; width:min(360px, calc(100vw - 24px)); padding:10px 12px; border-radius:10px; z-index:40;
+#xfer, #dl { position:fixed; right:12px; bottom:40px; width:min(360px, calc(100vw - 24px)); padding:10px 12px; border-radius:10px; z-index:40;
   background:var(--menu); -webkit-backdrop-filter:blur(24px); backdrop-filter:blur(24px); box-shadow:var(--shadow); }
-#xfer[hidden] { display:none; }
+#xfer[hidden], #dl[hidden] { display:none; }
+#xfer:not([hidden]) ~ #dl { bottom:170px; }
 .xh { display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:6px; }
 .xh .btn { height:22px; padding:0 8px; font-size:11px; }
 .xfile { display:flex; justify-content:space-between; gap:8px; font-size:11px; }
 .xfile span:first-child { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .xfile span:last-child { color:var(--label2); white-space:nowrap; }
-#xfer progress, .job .xp progress { display:block; width:100%; height:5px; margin:4px 0; accent-color:var(--accent); }
+#xfer progress, #dl progress, .job .xp progress { display:block; width:100%; height:5px; margin:4px 0; accent-color:var(--accent); }
 .xs { font-size:11px; color:var(--label2); font-variant-numeric:tabular-nums; }
-#xfer .xfile + progress + .xfile { margin-top:6px; }
-#xfer .xall { margin-top:8px; padding-top:4px; border-top:1px solid var(--sep); }
+#xfer .xfile + progress, #dl .xfile + progress + .xfile { margin-top:6px; }
+#xfer .xall, #dl .xall { margin-top:8px; padding-top:4px; border-top:1px solid var(--sep); }
 .sheet p.hint { margin:4px 0 0; font-size:11px; }
 .job summary { flex-wrap:wrap; } .job .xp { flex-basis:100%; min-width:0; }
 .ghost { position:fixed; top:-100px; left:0; padding:4px 10px; border-radius:12px; background:var(--accent); color:#fff; font-weight:600; }
@@ -294,6 +295,7 @@ dialog::backdrop { background:rgba(0,0,0,.2); }
 <div id="activity" popover><h2>Activity</h2><div id="jobs"></div></div>
 <div id="err" role="alert" hidden></div>
 <div id="xfer" hidden><div class="xh"><b id="xTitle"></b><button class="btn" id="xCancel">Cancel</button></div><div id="xBody"></div></div>
+<div id="dl" hidden><div class="xh"><b id="dlTitle"></b><button class="btn" id="dlCancel">Cancel all</button></div><div id="dlBody"></div></div>
 
 <dialog id="ql" aria-labelledby="qlTitle">
   <header>
@@ -384,6 +386,7 @@ function icon(it) {
 }
 const previewURL = it => `/api/preview?bucket=${enc(bucket)}&path=${enc(it.name)}`;
 const downloadURL = it => `/api/download?bucket=${enc(bucket)}&path=${enc(it.name)}`;
+const trackedURL = it => `${downloadURL(it)}&id=${Date.now().toString(36) + Math.random().toString(36).slice(2, 6)}&size=${it.size || 0}`;
 // images get the generic icon behind them, revealed if the browser can't decode (e.g. HEIC outside Safari)
 const imgOr = (it, attrs = '') => `<span hidden>${icon(it)}</span><img src="${previewURL(it)}" alt="" draggable="false" ${attrs}>`;
 addEventListener('error', e => { const t = e.target; if (t.tagName === 'IMG' && t.previousElementSibling?.hidden) { t.previousElementSibling.hidden = false; t.remove(); } }, true);
@@ -545,6 +548,7 @@ function quickLook() {
   $('#qlBody').innerHTML = previewHTML(it, true);
   if (!$('#ql').open) $('#ql').showModal();
 }
+$('#qlDl').onclick = () => { const it = byKey.get(qlKey); if (it) { $('#qlDl').href = trackedURL(it); setTimeout(pollDownloads, 300); } };
 $('#ql').onclose = () => { $('#qlBody').innerHTML = ''; qlKey = null; content.focus(); };
 $('#qlClose').onclick = () => $('#ql').close();
 $('#ql').onclick = e => { if (e.target === $('#ql')) $('#ql').close(); };
@@ -725,7 +729,7 @@ async function del(list) {
   progress(null); refresh([]);
 }
 function download(list) {
-  list.filter(i => !i.folder).forEach((it, i) => setTimeout(() => { const a = document.createElement('a'); a.href = downloadURL(it); a.download = ''; a.click(); }, i * 500));
+  list.filter(i => !i.folder).forEach((it, i) => setTimeout(() => { const a = document.createElement('a'); a.href = trackedURL(it); a.download = ''; a.click(); setTimeout(pollDownloads, 300); }, i * 500));
 }
 
 // ---------- transfer progress ----------
@@ -921,6 +925,33 @@ $('#dlg').onclose = async () => {
     await post('/api/sync', { bucket, prefix: $('#prefix').value, local: $('#local').value, direction: $('[name=dir]:checked').value, delete: $('#del').checked, dryRun: $('#dry').checked, threads: +$('#threads').value });
     await pollJobs(); $('#activity').showPopover();
   } catch {}
+};
+
+// ---------- downloads ----------
+const dlRates = new Map(), dlBatch = new Set(), dlNoted = new Set(); let dlT, dlOwns = false;
+async function pollDownloads() {
+  clearTimeout(dlT);
+  const all = await api('/api/downloads').catch(() => []), run = all.filter(d => d.status === 'running');
+  run.forEach(d => dlBatch.add(d.id));
+  all.forEach(d => { if (d.status === 'failed' && dlBatch.has(d.id) && !dlNoted.has(d.id)) { dlNoted.add(d.id); showErr(`Couldn’t download ${base(d.name)}.`); } });
+  $('#dl').hidden = !run.length;
+  if (run.length) {
+    const sum = k => run.reduce((t, d) => t + (d[k] || 0), 0), rate = run.reduce((t, d) => t + (dlRates.get(d.id) || dlRates.set(d.id, meter()).get(d.id))(d.sent, d.elapsed), 0);
+    const title = `Downloading ${run.length} file${run.length === 1 ? '' : 's'}`, done = sum('sent'), total = sum('size');
+    $('#dlTitle').textContent = title;
+    $('#dlBody').innerHTML = xferHTML({ files: run.map(d => ({ name: d.name, phase: '', frac: d.size ? d.sent / d.size : null })), done, total,
+      filesDone: dlBatch.size - run.length, filesTotal: dlBatch.size, speed: rate, elapsed: Math.max(...run.map(d => d.elapsed)) });
+    if (!uploading || dlOwns) { progress(title, total ? done / total : 0); dlOwns = true; }
+    dlT = setTimeout(pollDownloads, 500);
+  } else {
+    dlBatch.clear(); dlRates.clear();
+    if (dlOwns) { dlOwns = false; progress(null); }
+  }
+}
+$('#dlCancel').onclick = async () => {
+  const all = await api('/api/downloads').catch(() => []);
+  await Promise.all(all.filter(d => d.status === 'running').map(d => post('/api/download_cancel', { id: d.id }).catch(() => {})));
+  pollDownloads();
 };
 
 // ---------- jobs ----------
