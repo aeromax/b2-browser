@@ -37,6 +37,7 @@ LOCAL_ROOTS = [r for r in os.environ.get("B2UI_LOCAL_ROOTS", DATA_ROOT or ("/Vol
 BIG = 200 << 20  # b2sdk sends files this big as parallel parts; a job runs at most two such files (or folder syncs) at once
 SPOOL_PREFIX = "b2ui-upload-"
 JOBS = {}  # ponytail: in-memory job list, lost on restart; persist if you need history
+DOWNLOADS = {}  # id -> {id, name, size, sent, status, proc, started, ended}; in memory, finished ones pruned after a minute
 DL_AUTH = {}  # bucket -> (download base url, token, expiry)
 SDK_AUTH, SDK_LOCK = {}, threading.Lock()  # (keyId, key) -> authorized b2sdk account info, shared by every upload
 
@@ -353,6 +354,16 @@ def locate(files):
     return found
 
 
+def track_download(id, name, size):
+    now = time.time()
+    for k in [k for k, d in DOWNLOADS.items() if d["ended"] and now - d["ended"] > 60]:
+        del DOWNLOADS[k]
+    DOWNLOADS.pop(id, None)  # a reused id replaces the old entry
+    d = DOWNLOADS[id] = {"id": id, "name": name, "size": size, "sent": 0, "status": "running",
+                         "proc": None, "started": now, "ended": None}
+    return d
+
+
 class H(BaseHTTPRequestHandler):
     def send(self, code, body=b"", ctype="application/json", headers=()):
         if not isinstance(body, bytes):
@@ -431,23 +442,46 @@ class H(BaseHTTPRequestHandler):
             out.append({"name": f[5], "size": int(f[4]), "time": t, "folder": folder})
         self.send(200, out)
 
-    def stream(self, bucket, path, ctype, disposition, limit=None):
+    def stream(self, bucket, path, ctype, disposition, limit=None, dl=None):
         proc = subprocess.Popen(["b2", "file", "cat", uri(bucket, path)],
                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=b2_env())
+        if dl:
+            dl["proc"] = proc
         self.send_response(200)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Disposition", f"{disposition}; filename*=UTF-8''{quote(path.rsplit('/', 1)[-1])}")
-        self.end_headers()
+        if dl and dl["size"] is not None:
+            self.send_header("Content-Length", str(dl["size"]))
         sent = 0
         try:
+            self.end_headers()
             while (limit is None or sent < limit) and (chunk := proc.stdout.read(1 << 20)):
                 self.wfile.write(chunk)
                 sent += len(chunk)
+                if dl:
+                    dl["sent"] = sent
+            if dl and dl["status"] == "running":
+                dl["status"] = "failed" if dl["size"] is not None and sent < dl["size"] else "done"
+        except (BrokenPipeError, ConnectionResetError):  # browser went away: stop b2 too
+            if dl and dl["status"] == "running":
+                dl["status"] = "failed"
         finally:
             proc.kill()
+            proc.stdout.close()
+            proc.wait()  # reap it
+            if dl:
+                dl["ended"], dl["proc"] = time.time(), None
 
     def get_api_download(self, q):
-        self.stream(q.get("bucket"), q.get("path", ""), "application/octet-stream", "attachment")
+        bucket, path, id = q.get("bucket"), q.get("path", ""), q.get("id")
+        try:
+            size = int(q.get("size", ""))
+        except ValueError:
+            size = None
+        if size is not None and size < 0:
+            size = None
+        dl = track_download(id, path.rsplit("/", 1)[-1], size) if id else None
+        self.stream(bucket, path, "application/octet-stream", "attachment", dl=dl)
 
     def get_api_preview(self, q):
         bucket, path = q.get("bucket"), q.get("path", "")
@@ -651,6 +685,19 @@ class H(BaseHTTPRequestHandler):
             for p in [j["proc"], *j.get("procs", ())]:
                 if p:
                     p.terminate()
+        self.send(200, {"ok": True})
+
+    def get_api_downloads(self, q):
+        now = time.time()
+        self.send(200, [{**{k: v for k, v in d.items() if k not in ("proc", "started", "ended")},
+                         "elapsed": (d["ended"] or now) - d["started"]} for d in reversed(DOWNLOADS.values())])
+
+    def post_api_download_cancel(self, q):
+        d = DOWNLOADS.get(self.body().get("id"))
+        if d and d["status"] == "running":
+            d["status"] = "cancelled"  # first, so stream() doesn't overwrite it with failed
+            if d["proc"]:
+                d["proc"].terminate()
         self.send(200, {"ok": True})
 
 
